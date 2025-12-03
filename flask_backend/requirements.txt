@@ -2,7 +2,9 @@ apispec==6.8.1
 blinker==1.9.0
 click==8.1.8
 flake8==7.2.0
-Flask==2.0.1
+# Upgrade Flask to be compatible with Werkzeug 3.x and flask-smorest
+Flask==3.0.3
+# Keep flask-smorest as requested; it requires werkzeug>=3.0.1,<4
 flask-smorest==0.45.0
 iniconfig==2.1.0
 itsdangerous==2.2.0
@@ -16,8 +18,10 @@ pycodestyle==2.13.0
 pyflakes==3.3.2
 pytest==8.3.5
 webargs==8.6.0
-Werkzeug<3.0.0
-Flask-Cors==3.0.10
+# Pin Werkzeug to 3.x as required by flask-smorest
+Werkzeug>=3.0.1,<4
+# Update Flask-Cors to a version compatible with Flask 3.x
+Flask-Cors==4.0.0
 # Added for YouTube-to-MP3 functionality
 yt-dlp
 pydub==0.25.1

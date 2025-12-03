@@ -1,0 +1,2 @@
+# Dev-only tools for this backend container
+flake8==7.2.0
