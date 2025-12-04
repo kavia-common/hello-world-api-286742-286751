@@ -25,5 +25,15 @@ Example:
 Notes:
 - FFmpeg is required at runtime for audio processing by yt-dlp and pydub.
   Please ensure FFmpeg is installed in the deployment environment and available on PATH.
+
+  Quick install tips:
+  - Debian/Ubuntu: `sudo apt-get update && sudo apt-get install -y ffmpeg`
+  - macOS (Homebrew): `brew install ffmpeg`
+  - Windows (Chocolatey): `choco install ffmpeg`
+  - Windows (Scoop): `scoop install ffmpeg`
+
 - Files in /audios are retained for 2 hours and then cleaned up automatically.
 - Rate limiting is enabled per IP to protect the service.
+- Streaming headers: The /audios/<filename> route returns `Content-Type: audio/mpeg`,
+  includes `Accept-Ranges: bytes` (supports partial content), and sets
+  `Content-Disposition: inline; filename="<filename>"`.

@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import shutil
 from typing import Generator, Optional, Tuple
 
 from flask import request, Response, send_from_directory
@@ -118,6 +119,8 @@ def make_partial_response(file_path: str, start: int, end: int) -> Response:
     rv.headers["Accept-Ranges"] = "bytes"
     rv.headers["Content-Length"] = str(end - start + 1)
     rv.headers["Cache-Control"] = "public, max-age=7200"
+    # Provide a stable filename via Content-Disposition for clients/downloaders
+    rv.headers["Content-Disposition"] = f'inline; filename="{os.path.basename(file_path)}"'
     return rv
 
 
@@ -127,6 +130,7 @@ def make_entire_response(filename: str) -> Response:
     rv = send_from_directory(AUDIOS_DIR, filename, mimetype="audio/mpeg", as_attachment=False)
     rv.headers["Accept-Ranges"] = "bytes"
     rv.headers["Cache-Control"] = "public, max-age=7200"
+    rv.headers["Content-Disposition"] = f'inline; filename="{filename}"'
     return rv
 
 
@@ -215,10 +219,43 @@ class Search(MethodView):
 class Download(MethodView):
     # PUBLIC_INTERFACE
     def get(self):
-        """Download YouTube audio as MP3 (<= 5 minutes) and return a JSON with access link and expiration."""
+        """Download YouTube audio as MP3 (<= 5 minutes).
+
+        Summary:
+            Download YouTube audio as an MP3 and return a JSON payload containing a direct link
+            to stream the file and an expiration timestamp.
+
+        Returns:
+            tuple: (JSON dict, HTTP status code). On success, includes:
+                - img: Thumbnail URL.
+                - direct_link: The path to stream the MP3 (GET /audios/<filename>).
+                - expiration_timestamp: Unix epoch when the file will be deleted.
+
+        Error Handling:
+            - If 'url' is missing: 400 with message.
+            - If ffmpeg is not installed: 500 with actionable guidance.
+            - If video is too long (> 5 minutes): 400.
+            - If extraction/download fails: 400/500 with message.
+        """
         url = request.args.get("url", "", type=str).strip()
         if not url:
             return {"error": "Missing required query parameter 'url'."}, 400
+
+        # Validate ffmpeg availability early to provide a friendly message
+        if shutil.which("ffmpeg") is None:
+            return (
+                {
+                    "error": "FFmpeg is required but was not found on the system PATH.",
+                    "action": "Please install FFmpeg and ensure it is available on PATH.",
+                    "tips": {
+                        "debian_ubuntu": "sudo apt-get update && sudo apt-get install -y ffmpeg",
+                        "macos_brew": "brew install ffmpeg",
+                        "windows_choco": "choco install ffmpeg",
+                        "windows_scoop": "scoop install ffmpeg",
+                    },
+                },
+                500,
+            )
 
         # Probe metadata first to enforce duration limit
         ydl_probe_opts = {
@@ -262,7 +299,17 @@ class Download(MethodView):
             with YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
         except Exception as e:
-            return {"error": f"Download failed: {str(e)}"}, 500
+            # yt-dlp errors when ffmpeg is missing; provide a more actionable hint
+            msg = str(e)
+            if "ffmpeg" in msg.lower():
+                return (
+                    {
+                        "error": f"Download failed: {msg}",
+                        "action": "FFmpeg appears to be missing or inaccessible. Install FFmpeg and ensure it is on PATH.",
+                    },
+                    500,
+                )
+            return {"error": f"Download failed: {msg}"}, 500
 
         mp3_path = os.path.join(AUDIOS_DIR, f"{video_id}.mp3")
         if not os.path.exists(mp3_path):
@@ -273,7 +320,7 @@ class Download(MethodView):
             else:
                 return {"error": "MP3 file not found after download."}, 500
 
-        # Final compression/standardization pass
+        # Final compression/standardization pass (ignore errors internally)
         compress_audio(mp3_path, bitrate="256k")
 
         expiration_ts = _now_ts() + RETENTION_SECONDS
