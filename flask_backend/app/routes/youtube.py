@@ -686,12 +686,16 @@ def summarize():
         }, 503
 
     # Ensure GROQ_API_KEY present
-    if not os.getenv("GROQ_API_KEY"):
+    groq_key = os.getenv("GROQ_API_KEY")
+    if not groq_key:
         return {
             "error": "Server misconfiguration: GROQ_API_KEY is not set.",
             "action": "Set GROQ_API_KEY environment variable for Groq client authentication.",
             "service_status": "misconfigured"
         }, 503
+    
+    # Log configuration status (sanitized)
+    _log("info", f"[/summarize] Configuration check: GROQ_API_KEY={'present' if groq_key else 'missing'}, length={len(groq_key) if groq_key else 0}")
 
     # Reuse download logic to fetch local mp3 (with cookies delivered via body or fallback file)
     try:
@@ -730,7 +734,17 @@ def summarize():
     # Transcribe with Groq Whisper
     transcript_text = ""
     try:
+        # Log Groq client initialization - DEBUGGING proxies issue
+        groq_api_key = os.getenv("GROQ_API_KEY")
+        if groq_api_key:
+            _log("info", f"[/summarize] GROQ_API_KEY present: {groq_api_key[:8]}...{groq_api_key[-4:] if len(groq_api_key) > 12 else '***'}")
+        else:
+            _log("warning", "[/summarize] GROQ_API_KEY not found in environment")
+        
+        _log("info", "[/summarize] Initializing Groq client with NO kwargs (using env GROQ_API_KEY only)")
         client = Groq()
+        _log("info", f"[/summarize] Groq client initialized successfully: {type(client).__name__}")
+        
         filename = os.path.basename(mp3_path)
         with open(mp3_path, "rb") as f:
             file_bytes = f.read()
@@ -772,7 +786,10 @@ def summarize():
         return chunks
 
     try:
+        _log("info", "[/summarize] Initializing Groq client for summarization (NO kwargs)")
         client = Groq()
+        _log("info", f"[/summarize] Groq summarization client initialized: {type(client).__name__}")
+        
         # If transcript very large, include only first chunk to stay within token limits
         chunks = _chunk_text(transcript_text, 8000)
         prompt = (
