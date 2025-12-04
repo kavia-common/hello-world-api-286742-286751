@@ -2,6 +2,8 @@ import os
 import re
 import time
 import shutil
+import tempfile
+import base64
 from typing import Generator, Optional, Tuple
 
 from flask import request, Response, send_from_directory
@@ -217,20 +219,37 @@ class Search(MethodView):
 # PUBLIC_INTERFACE
 @blp.route("/download")
 @limiter.limit("6 per minute")
-@blp.doc(parameters=[{
-    "name": "url",
-    "in": "query",
-    "required": True,
-    "schema": {"type": "string"},
-    "description": "YouTube video URL to download as MP3 (<= 5 minutes)",
-    "example": "https://www.youtube.com/watch?v=abc123"
-}])
+@blp.doc(parameters=[
+    {
+        "name": "url",
+        "in": "query",
+        "required": True,
+        "schema": {"type": "string"},
+        "description": "YouTube video URL to download as MP3 (<= 5 minutes)",
+        "example": "https://www.youtube.com/watch?v=abc123"
+    },
+    {
+        "name": "X-YTDLP-Cookies",
+        "in": "header",
+        "required": False,
+        "schema": {"type": "string"},
+        "description": "Optional base64-encoded Netscape cookies.txt content for yt-dlp. If provided, it is written to a secure temp file for this request and takes precedence over the server-side YTDLP_COOKIES_FILE."
+    }
+])
 def download():
     """Download YouTube audio as MP3 (<= 5 minutes).
 
     Summary:
         Download YouTube audio as an MP3 and return a JSON payload containing a direct link
         to stream the file and an expiration timestamp.
+
+    Cookie Support:
+        - Server-side file: If environment variable YTDLP_COOKIES_FILE is set and points to an existing
+          Netscape-format cookies.txt file, it will be passed to yt-dlp.
+        - Per-request header override: If the "X-YTDLP-Cookies" request header is provided, it must contain
+          base64-encoded Netscape cookies.txt content. The server will write this content to a secure temporary
+          file for the duration of the request and pass it to yt-dlp, taking precedence over YTDLP_COOKIES_FILE.
+          The temporary file is deleted after the request.
 
     Returns:
         tuple: (JSON dict, HTTP status code). On success, includes:
@@ -240,6 +259,7 @@ def download():
 
     Error Handling:
         - If 'url' is missing: 400 with message.
+        - If invalid base64 is supplied for the X-YTDLP-Cookies header: 400.
         - If ffmpeg is not installed: 500 with actionable guidance.
         - If video is too long (> 5 minutes): 400.
         - If extraction/download fails: 400/500 with message.
@@ -264,26 +284,84 @@ def download():
             500,
         )
 
+    cookiefile_path: Optional[str] = None
+    delete_tmp_cookiefile: bool = False
+
+    # Read optional base64-encoded Netscape cookies from header (takes precedence)
+    header_b64 = request.headers.get("X-YTDLP-Cookies")
+    if header_b64:
+        try:
+            decoded = base64.b64decode(header_b64, validate=True)
+        except Exception:
+            return {"error": "Invalid base64 in X-YTDLP-Cookies header."}, 400
+        # Create a secure temporary file for this request only
+        try:
+            with tempfile.NamedTemporaryFile(prefix="ydl_cookies_", suffix=".txt", delete=False) as tf:
+                # Restrict permissions on POSIX systems
+                try:
+                    os.chmod(tf.name, 0o600)
+                except Exception:
+                    # On non-POSIX, chmod may not be supported; ignore
+                    pass
+                tf.write(decoded)
+                cookiefile_path = tf.name
+                delete_tmp_cookiefile = True
+        except Exception as e:
+            return {"error": f"Failed to create temporary cookie file: {e}"}, 500
+    else:
+        # Fallback to server-side cookies file via environment variable
+        env_cookie_path = os.getenv("YTDLP_COOKIES_FILE")
+        if env_cookie_path and os.path.isfile(env_cookie_path):
+            cookiefile_path = env_cookie_path
+
     # Probe metadata first to enforce duration limit
     ydl_probe_opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
     }
+    if cookiefile_path:
+        ydl_probe_opts["cookiefile"] = cookiefile_path
+
     try:
         with YoutubeDL(ydl_probe_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
+        # Ensure cleanup of temp file on early failure
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+            except Exception:
+                pass
         return {"error": f"Failed to retrieve video info: {str(e)}"}, 400
 
     duration = info.get("duration")  # seconds
     if duration is None:
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+            except Exception:
+                pass
         return {"error": "Unable to determine video duration."}, 400
     if duration > 300:
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+            except Exception:
+                pass
         return {"error": "Video is longer than 5 minutes and cannot be processed."}, 400
 
     video_id = info.get("id")
     if not video_id:
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+            except Exception:
+                pass
         return {"error": "Could not determine video id."}, 400
 
     outtmpl = os.path.join(AUDIOS_DIR, "%(id)s.%(ext)s")
@@ -301,6 +379,8 @@ def download():
             }
         ],
     }
+    if cookiefile_path:
+        ydl_opts["cookiefile"] = cookiefile_path
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
@@ -309,6 +389,12 @@ def download():
         # yt-dlp errors when ffmpeg is missing; provide a more actionable hint
         msg = str(e)
         if "ffmpeg" in msg.lower():
+            if delete_tmp_cookiefile and cookiefile_path:
+                try:
+                    if os.path.exists(cookiefile_path):
+                        os.remove(cookiefile_path)
+                except Exception:
+                    pass
             return (
                 {
                     "error": f"Download failed: {msg}",
@@ -316,7 +402,22 @@ def download():
                 },
                 500,
             )
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+            except Exception:
+                pass
         return {"error": f"Download failed: {msg}"}, 500
+    finally:
+        # Ensure temp cookie file is deleted after the operation completes
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+            except Exception:
+                # Silently ignore cleanup errors
+                pass
 
     mp3_path = os.path.join(AUDIOS_DIR, f"{video_id}.mp3")
     if not os.path.exists(mp3_path):

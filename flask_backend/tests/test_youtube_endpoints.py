@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import shutil
 import pytest
 
@@ -116,3 +117,68 @@ def test_download_success_and_stream_headers(monkeypatch):
     cd2 = partial_resp.headers.get("Content-Disposition", "")
     assert "filename=" in cd2
     assert filename in cd2
+
+
+def test_download_uses_header_cookies_and_cleans_up_temp(monkeypatch):
+    client = flask_app.test_client()
+
+    # Simulate ffmpeg present
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/ffmpeg")
+
+    seen_opts = []
+
+    class FakeYDL:
+        def __init__(self, opts=None):
+            self.opts = opts or {}
+            seen_opts.append(self.opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {
+                "id": "xyz789",
+                "duration": 120,
+                "thumbnail": "http://thumb/img2.jpg",
+            }
+
+        def download(self, urls):
+            # Write a small fake mp3
+            mp3_path = os.path.join(yt_module.AUDIOS_DIR, "xyz789.mp3")
+            os.makedirs(os.path.dirname(mp3_path), exist_ok=True)
+            with open(mp3_path, "wb") as f:
+                f.write(b"ID3")
+                f.write(b"\x00" * 256)
+
+    monkeypatch.setattr(yt_module, "YoutubeDL", FakeYDL)
+
+    # Prepare a simple cookies.txt-like content and base64-encode it
+    cookies_content = b"# Netscape HTTP Cookie File\n.example.com\tTRUE\t/\tFALSE\t0\tsid\tabcdef\n"
+    header_value = base64.b64encode(cookies_content).decode("ascii")
+
+    # Call endpoint with header
+    resp = client.get(
+        "/download",
+        query_string={"url": "https://www.youtube.com/watch?v=xyz789"},
+        headers={"X-YTDLP-Cookies": header_value},
+    )
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert "direct_link" in payload
+
+    # Validate that cookiefile was passed to yt-dlp during both probe and download phases
+    cookie_paths = []
+    for opts in seen_opts:
+        assert "cookiefile" in opts
+        cookie_paths.append(opts["cookiefile"])
+        # Temp file should have existed at the time yt-dlp was constructed
+        assert os.path.isabs(opts["cookiefile"])
+        assert os.path.exists(opts["cookiefile"])
+
+    # After the request completes, the temp file should have been deleted
+    # (header cookies take precedence, and temp file is removed in finally)
+    for p in set(cookie_paths):
+        assert not os.path.exists(p)

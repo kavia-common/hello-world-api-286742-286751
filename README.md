@@ -38,3 +38,19 @@ Notes:
 - Streaming headers: The /audios/<filename> route returns `Content-Type: audio/mpeg`,
   includes `Accept-Ranges: bytes` (supports partial content), and sets
   `Content-Disposition: inline; filename="<filename>"`.
+
+Cookie support (yt-dlp):
+- Why: Some YouTube content requires cookies (e.g., age-restricted or region-locked).
+- Server-side file (env): Set YTDLP_COOKIES_FILE in the environment to the absolute path of a Netscape-format cookies.txt file. If present and readable, it will be used for all requests.
+  - Example (Linux/Mac): export YTDLP_COOKIES_FILE="/path/to/cookies.txt"
+- Per-request override (header): You can send a request header "X-YTDLP-Cookies" containing a base64-encoded Netscape cookies.txt file content. This takes precedence over the env var for that request only. The server stores it in a secure temporary file and deletes it after use.
+  - Example to base64-encode (Linux/Mac): base64 -w 0 cookies.txt
+  - curl example:
+    curl -G "https://<host>:3001/download" \
+      --data-urlencode "url=https://www.youtube.com/watch?v=<id>" \
+      -H "X-YTDLP-Cookies: $(base64 -w 0 cookies.txt)"
+
+How to export cookies:
+- Use a browser extension that exports cookies in Netscape format (e.g., "cookies.txt" for Chrome/Firefox).
+- Ensure the file is in the standard "Netscape HTTP Cookie File" format; yt-dlp requires this format.
+- Security note: Treat cookies like credentials. Prefer the per-request header for single-use scenarios and avoid committing cookie files to source control.
