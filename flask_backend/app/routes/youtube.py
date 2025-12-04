@@ -214,144 +214,151 @@ class Search(MethodView):
             return {"error": f"Search failed: {str(e)}"}, 500
 
 
+# PUBLIC_INTERFACE
 @blp.route("/download")
 @limiter.limit("6 per minute")
-class Download(MethodView):
-    # PUBLIC_INTERFACE
-    def get(self):
-        """Download YouTube audio as MP3 (<= 5 minutes).
+def download():
+    """Download YouTube audio as MP3 (<= 5 minutes).
 
-        Summary:
-            Download YouTube audio as an MP3 and return a JSON payload containing a direct link
-            to stream the file and an expiration timestamp.
+    Summary:
+        Download YouTube audio as an MP3 and return a JSON payload containing a direct link
+        to stream the file and an expiration timestamp.
 
-        Returns:
-            tuple: (JSON dict, HTTP status code). On success, includes:
-                - img: Thumbnail URL.
-                - direct_link: The path to stream the MP3 (GET /audios/<filename>).
-                - expiration_timestamp: Unix epoch when the file will be deleted.
+    Returns:
+        tuple: (JSON dict, HTTP status code). On success, includes:
+            - img: Thumbnail URL.
+            - direct_link: The path to stream the MP3 (GET /audios/<filename>).
+            - expiration_timestamp: Unix epoch when the file will be deleted.
 
-        Error Handling:
-            - If 'url' is missing: 400 with message.
-            - If ffmpeg is not installed: 500 with actionable guidance.
-            - If video is too long (> 5 minutes): 400.
-            - If extraction/download fails: 400/500 with message.
-        """
-        url = request.args.get("url", "", type=str).strip()
-        if not url:
-            return {"error": "Missing required query parameter 'url'."}, 400
+    Error Handling:
+        - If 'url' is missing: 400 with message.
+        - If ffmpeg is not installed: 500 with actionable guidance.
+        - If video is too long (> 5 minutes): 400.
+        - If extraction/download fails: 400/500 with message.
+    """
+    url = request.args.get("url", "", type=str).strip()
+    if not url:
+        return {"error": "Missing required query parameter 'url'."}, 400
 
-        # Validate ffmpeg availability early to provide a friendly message
-        if shutil.which("ffmpeg") is None:
+    # Validate ffmpeg availability early to provide a friendly message
+    if shutil.which("ffmpeg") is None:
+        return (
+            {
+                "error": "FFmpeg is required but was not found on the system PATH.",
+                "action": "Please install FFmpeg and ensure it is available on PATH.",
+                "tips": {
+                    "debian_ubuntu": "sudo apt-get update && sudo apt-get install -y ffmpeg",
+                    "macos_brew": "brew install ffmpeg",
+                    "windows_choco": "choco install ffmpeg",
+                    "windows_scoop": "scoop install ffmpeg",
+                },
+            },
+            500,
+        )
+
+    # Probe metadata first to enforce duration limit
+    ydl_probe_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+    }
+    try:
+        with YoutubeDL(ydl_probe_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        return {"error": f"Failed to retrieve video info: {str(e)}"}, 400
+
+    duration = info.get("duration")  # seconds
+    if duration is None:
+        return {"error": "Unable to determine video duration."}, 400
+    if duration > 300:
+        return {"error": "Video is longer than 5 minutes and cannot be processed."}, 400
+
+    video_id = info.get("id")
+    if not video_id:
+        return {"error": "Could not determine video id."}, 400
+
+    outtmpl = os.path.join(AUDIOS_DIR, "%(id)s.%(ext)s")
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": outtmpl,
+        "quiet": True,
+        "noprogress": True,
+        "no_warnings": True,
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "256",
+            }
+        ],
+    }
+
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+    except Exception as e:
+        # yt-dlp errors when ffmpeg is missing; provide a more actionable hint
+        msg = str(e)
+        if "ffmpeg" in msg.lower():
             return (
                 {
-                    "error": "FFmpeg is required but was not found on the system PATH.",
-                    "action": "Please install FFmpeg and ensure it is available on PATH.",
-                    "tips": {
-                        "debian_ubuntu": "sudo apt-get update && sudo apt-get install -y ffmpeg",
-                        "macos_brew": "brew install ffmpeg",
-                        "windows_choco": "choco install ffmpeg",
-                        "windows_scoop": "scoop install ffmpeg",
-                    },
+                    "error": f"Download failed: {msg}",
+                    "action": "FFmpeg appears to be missing or inaccessible. Install FFmpeg and ensure it is on PATH.",
                 },
                 500,
             )
+        return {"error": f"Download failed: {msg}"}, 500
 
-        # Probe metadata first to enforce duration limit
-        ydl_probe_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-        }
-        try:
-            with YoutubeDL(ydl_probe_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-        except Exception as e:
-            return {"error": f"Failed to retrieve video info: {str(e)}"}, 400
+    mp3_path = os.path.join(AUDIOS_DIR, f"{video_id}.mp3")
+    if not os.path.exists(mp3_path):
+        # Some videos use different extensions; find the first mp3 for this id
+        candidates = [p for p in os.listdir(AUDIOS_DIR) if p.startswith(video_id) and p.endswith(".mp3")]
+        if candidates:
+            mp3_path = os.path.join(AUDIOS_DIR, candidates[0])
+        else:
+            return {"error": "MP3 file not found after download."}, 500
 
-        duration = info.get("duration")  # seconds
-        if duration is None:
-            return {"error": "Unable to determine video duration."}, 400
-        if duration > 300:
-            return {"error": "Video is longer than 5 minutes and cannot be processed."}, 400
+    # Final compression/standardization pass (ignore errors internally)
+    compress_audio(mp3_path, bitrate="256k")
 
-        video_id = info.get("id")
-        if not video_id:
-            return {"error": "Could not determine video id."}, 400
+    expiration_ts = _now_ts() + RETENTION_SECONDS
+    thumbnail = info.get("thumbnail")
+    filename = os.path.basename(mp3_path)
+    direct_link = f"/audios/{filename}"
 
-        outtmpl = os.path.join(AUDIOS_DIR, "%(id)s.%(ext)s")
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": outtmpl,
-            "quiet": True,
-            "noprogress": True,
-            "no_warnings": True,
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "256",
-                }
-            ],
-        }
-
-        try:
-            with YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-        except Exception as e:
-            # yt-dlp errors when ffmpeg is missing; provide a more actionable hint
-            msg = str(e)
-            if "ffmpeg" in msg.lower():
-                return (
-                    {
-                        "error": f"Download failed: {msg}",
-                        "action": "FFmpeg appears to be missing or inaccessible. Install FFmpeg and ensure it is on PATH.",
-                    },
-                    500,
-                )
-            return {"error": f"Download failed: {msg}"}, 500
-
-        mp3_path = os.path.join(AUDIOS_DIR, f"{video_id}.mp3")
-        if not os.path.exists(mp3_path):
-            # Some videos use different extensions; find the first mp3 for this id
-            candidates = [p for p in os.listdir(AUDIOS_DIR) if p.startswith(video_id) and p.endswith(".mp3")]
-            if candidates:
-                mp3_path = os.path.join(AUDIOS_DIR, candidates[0])
-            else:
-                return {"error": "MP3 file not found after download."}, 500
-
-        # Final compression/standardization pass (ignore errors internally)
-        compress_audio(mp3_path, bitrate="256k")
-
-        expiration_ts = _now_ts() + RETENTION_SECONDS
-        thumbnail = info.get("thumbnail")
-        filename = os.path.basename(mp3_path)
-        direct_link = f"/audios/{filename}"
-
-        return {
-            "img": thumbnail,
-            "direct_link": direct_link,
-            "expiration_timestamp": expiration_ts,
-        }, 200
+    return {
+        "img": thumbnail,
+        "direct_link": direct_link,
+        "expiration_timestamp": expiration_ts,
+    }, 200
 
 
+# PUBLIC_INTERFACE
 @blp.route("/audios/<path:filename>")
 @limiter.limit("60 per minute")
-class AudioStream(MethodView):
-    # PUBLIC_INTERFACE
-    def get(self, filename: str):
-        """Serve MP3 files with HTTP Range support (206 Partial Content)."""
-        file_path = os.path.join(AUDIOS_DIR, filename)
-        if not os.path.isfile(file_path):
-            return {"error": "File not found."}, 404
+def audio_stream(filename: str):
+    """Serve MP3 files with HTTP Range support (206 Partial Content).
 
-        file_size = os.path.getsize(file_path)
-        range_header = request.headers.get("Range", None)
-        byte_range = parse_range_header(range_header, file_size)
+    Parameters:
+        filename (str): The path component identifying the audio file to stream.
 
-        if byte_range is None:
-            # Entire file
-            return make_entire_response(filename)
+    Returns:
+        - 404 JSON if file not found.
+        - 200 Response with full file and headers when Range header missing.
+        - 206 Response with partial content and appropriate headers when Range header present.
+    """
+    file_path = os.path.join(AUDIOS_DIR, filename)
+    if not os.path.isfile(file_path):
+        return {"error": "File not found."}, 404
 
-        start, end = byte_range
-        return make_partial_response(file_path, start, end)
+    file_size = os.path.getsize(file_path)
+    range_header = request.headers.get("Range", None)
+    byte_range = parse_range_header(range_header, file_size)
+
+    if byte_range is None:
+        # Entire file
+        return make_entire_response(filename)
+
+    start, end = byte_range
+    return make_partial_response(file_path, start, end)
