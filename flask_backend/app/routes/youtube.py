@@ -102,9 +102,52 @@ def _preview_cookies_content(content: bytes) -> Tuple[bool, str, str]:
     return False, first_line, "Cookies content does not appear to be in Netscape cookies.txt format."
 
 
+def _read_cookies_file(path: str) -> Tuple[Optional[bytes], str]:
+    """
+    Read a cookie file and return (decoded_content, format_description).
+    Automatically detects and decodes base64-encoded content.
+    Returns (None, error_reason) on failure.
+    """
+    try:
+        if not os.path.isfile(path) or not os.access(path, os.R_OK):
+            return None, "File not found or not readable."
+        
+        with open(path, "rb") as f:
+            content = f.read()
+        
+        # First, try to interpret as-is
+        is_net, first, reason = _preview_cookies_content(content)
+        if is_net:
+            return content, "raw Netscape format"
+        
+        # If not valid Netscape, check if it might be base64-encoded
+        try:
+            text = content.decode("utf-8", errors="replace").strip()
+            lines = text.splitlines()
+            if len(lines) <= 2:  # base64 might have one or two lines
+                b64_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r \t")
+                if set(text) <= b64_chars and len(text.strip()) > 0:
+                    try:
+                        decoded = base64.b64decode(text, validate=True)
+                        is_net_decoded, first_decoded, reason_decoded = _preview_cookies_content(decoded)
+                        if is_net_decoded:
+                            return decoded, "base64-decoded Netscape format"
+                        else:
+                            return None, f"File appears to be base64 but decoded content is not valid Netscape: {reason_decoded}"
+                    except Exception as e:
+                        return None, f"File appears to be base64 but decoding failed: {str(e)}"
+        except Exception:
+            pass
+        
+        return None, reason
+    except Exception as e:
+        return None, f"Error reading file: {str(e)}"
+
+
 def _preview_cookies_file(path: str, max_bytes: int = 4096) -> Tuple[bool, int, str, bool, str]:
     """
     Return (exists, size, first_line, is_netscape, reason) for a cookies file path.
+    Automatically detects and decodes base64-encoded Netscape cookies.
     """
     try:
         exists = os.path.isfile(path) and os.access(path, os.R_OK)
@@ -113,7 +156,37 @@ def _preview_cookies_file(path: str, max_bytes: int = 4096) -> Tuple[bool, int, 
         size = os.path.getsize(path)
         with open(path, "rb") as f:
             content = f.read(max_bytes)
+        
+        # First, try to interpret as-is
         is_net, first, reason = _preview_cookies_content(content)
+        if is_net:
+            return True, size, first, is_net, reason
+        
+        # If not valid Netscape, check if it might be base64-encoded
+        # Heuristic: if content has no newlines and appears to be base64, try decoding
+        try:
+            text = content.decode("utf-8", errors="replace").strip()
+            # Check if it looks like base64: single line or minimal whitespace, only base64 chars
+            lines = text.splitlines()
+            if len(lines) <= 2:  # base64 might have one or two lines
+                # Check if predominantly base64 characters
+                b64_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r \t")
+                if set(text) <= b64_chars and len(text.strip()) > 0:
+                    # Attempt base64 decode
+                    try:
+                        decoded = base64.b64decode(text, validate=True)
+                        is_net_decoded, first_decoded, reason_decoded = _preview_cookies_content(decoded)
+                        if is_net_decoded:
+                            return True, size, first_decoded, is_net_decoded, "base64-decoded Netscape format"
+                        else:
+                            return True, size, first, False, f"File appears to be base64 but decoded content is not valid Netscape: {reason_decoded}"
+                    except Exception:
+                        # Not valid base64 or decode failed
+                        pass
+        except Exception:
+            pass
+        
+        # If we reach here, original validation failed and base64 decode either failed or wasn't applicable
         return True, size, first, is_net, reason
     except Exception as e:
         return False, 0, "", False, f"Error reading file: {e}"
@@ -333,19 +406,33 @@ def _download_audio_to_local_mp3(url: str, cookies_b64: Optional[str], header_b6
         _log("info", f"[download] Checking fallback cookie file: {fallback_abs_path}")
         
         if os.path.exists(FALLBACK_COOKIES_FILE):
-            exists, size, first_line, is_net, reason = _preview_cookies_file(FALLBACK_COOKIES_FILE)
-            # Sanitize first_line to avoid leaking full cookie values (show only first 80 chars)
-            sanitized_first = first_line[:80] + ('...' if len(first_line) > 80 else '')
-            _log("info", f"[download] Fallback file check: exists={exists}, size={size}B, is_netscape={is_net}, first_line='{sanitized_first}'")
+            # Use enhanced reader that detects and decodes base64
+            decoded_content, format_desc = _read_cookies_file(FALLBACK_COOKIES_FILE)
             
-            if exists and is_net:
-                cookiefile_path = FALLBACK_COOKIES_FILE
-                cookie_source = "file"
-                _log("info", f"[download] ✓ Using validated fallback cookie file: {fallback_abs_path} (size={size} bytes, format=Netscape)")
-            elif exists and not is_net:
-                _log("warning", f"[download] ✗ Fallback cookie file exists but INVALID format: {reason}. File will NOT be used.")
-            elif not exists:
-                _log("warning", f"[download] ✗ Fallback cookie file not readable: {reason}")
+            if decoded_content:
+                # Content is valid - check if we need to write to temp file or use directly
+                if "base64-decoded" in format_desc:
+                    # Write decoded content to temp file
+                    try:
+                        with tempfile.NamedTemporaryFile(prefix="ydl_cookies_fallback_", suffix=".txt", delete=False) as tf:
+                            try:
+                                os.chmod(tf.name, 0o600)
+                            except Exception:
+                                pass
+                            tf.write(decoded_content)
+                            cookiefile_path = tf.name
+                            delete_tmp_cookiefile = True
+                            cookie_source = "file_b64"
+                            _log("info", f"[download] ✓ Using fallback cookie file: {fallback_abs_path} ({format_desc}, size={len(decoded_content)}B, written to temp: {cookiefile_path})")
+                    except Exception as e:
+                        _log("warning", f"[download] ✗ Failed to write decoded fallback cookies to temp file: {e}")
+                else:
+                    # Use file directly (raw Netscape format)
+                    cookiefile_path = FALLBACK_COOKIES_FILE
+                    cookie_source = "file"
+                    _log("info", f"[download] ✓ Using fallback cookie file: {fallback_abs_path} ({format_desc}, size={len(decoded_content)}B)")
+            else:
+                _log("warning", f"[download] ✗ Fallback cookie file invalid: {format_desc}. File will NOT be used.")
         else:
             _log("info", f"[download] Fallback cookie file does not exist at: {fallback_abs_path}")
         
@@ -355,18 +442,32 @@ def _download_audio_to_local_mp3(url: str, cookies_b64: Optional[str], header_b6
             if env_cookie_path:
                 env_abs_path = os.path.abspath(env_cookie_path)
                 _log("info", f"[download] Checking env cookie file: {env_abs_path}")
-                exists, size, first_line, is_net, reason = _preview_cookies_file(env_cookie_path)
-                sanitized_first = first_line[:80] + ('...' if len(first_line) > 80 else '')
-                _log("info", f"[download] Env file check: exists={exists}, size={size}B, is_netscape={is_net}, first_line='{sanitized_first}'")
                 
-                if exists and is_net:
-                    cookiefile_path = env_cookie_path
-                    cookie_source = "env"
-                    _log("info", f"[download] ✓ Using validated env cookie file: {env_abs_path} (size={size} bytes, format=Netscape)")
-                elif exists and not is_net:
-                    _log("warning", f"[download] ✗ Env cookie file exists but INVALID format: {reason}. File will NOT be used.")
+                decoded_content, format_desc = _read_cookies_file(env_cookie_path)
+                
+                if decoded_content:
+                    if "base64-decoded" in format_desc:
+                        # Write decoded content to temp file
+                        try:
+                            with tempfile.NamedTemporaryFile(prefix="ydl_cookies_env_", suffix=".txt", delete=False) as tf:
+                                try:
+                                    os.chmod(tf.name, 0o600)
+                                except Exception:
+                                    pass
+                                tf.write(decoded_content)
+                                cookiefile_path = tf.name
+                                delete_tmp_cookiefile = True
+                                cookie_source = "env_b64"
+                                _log("info", f"[download] ✓ Using env cookie file: {env_abs_path} ({format_desc}, size={len(decoded_content)}B, written to temp: {cookiefile_path})")
+                        except Exception as e:
+                            _log("warning", f"[download] ✗ Failed to write decoded env cookies to temp file: {e}")
+                    else:
+                        # Use file directly
+                        cookiefile_path = env_cookie_path
+                        cookie_source = "env"
+                        _log("info", f"[download] ✓ Using env cookie file: {env_abs_path} ({format_desc}, size={len(decoded_content)}B)")
                 else:
-                    _log("warning", f"[download] ✗ Env cookie file not readable: {reason}")
+                    _log("warning", f"[download] ✗ Env cookie file invalid: {format_desc}. File will NOT be used.")
             else:
                 _log("info", "[download] No YTDLP_COOKIES_FILE environment variable set")
 
@@ -880,19 +981,33 @@ def download():
         _log("info", f"[/download] Checking fallback cookie file: {fallback_abs_path}")
         
         if os.path.exists(FALLBACK_COOKIES_FILE):
-            exists, size, first_line, is_net, reason = _preview_cookies_file(FALLBACK_COOKIES_FILE)
-            # Sanitize first_line to avoid leaking full cookie values (show only first 80 chars)
-            sanitized_first = first_line[:80] + ('...' if len(first_line) > 80 else '')
-            _log("info", f"[/download] Fallback file check: exists={exists}, size={size}B, is_netscape={is_net}, first_line='{sanitized_first}'")
+            # Use enhanced reader that detects and decodes base64
+            decoded_content, format_desc = _read_cookies_file(FALLBACK_COOKIES_FILE)
             
-            if exists and is_net:
-                cookiefile_path = FALLBACK_COOKIES_FILE
-                cookie_source = "file"
-                _log("info", f"[/download] ✓ Using validated fallback cookie file: {fallback_abs_path} (size={size} bytes, format=Netscape)")
-            elif exists and not is_net:
-                _log("warning", f"[/download] ✗ Fallback cookie file exists but INVALID format: {reason}. File will NOT be used.")
-            elif not exists:
-                _log("warning", f"[/download] ✗ Fallback cookie file not readable: {reason}")
+            if decoded_content:
+                # Content is valid - check if we need to write to temp file or use directly
+                if "base64-decoded" in format_desc:
+                    # Write decoded content to temp file
+                    try:
+                        with tempfile.NamedTemporaryFile(prefix="ydl_cookies_fallback_", suffix=".txt", delete=False) as tf:
+                            try:
+                                os.chmod(tf.name, 0o600)
+                            except Exception:
+                                pass
+                            tf.write(decoded_content)
+                            cookiefile_path = tf.name
+                            delete_tmp_cookiefile = True
+                            cookie_source = "file_b64"
+                            _log("info", f"[/download] ✓ Using fallback cookie file: {fallback_abs_path} ({format_desc}, size={len(decoded_content)}B, written to temp: {cookiefile_path})")
+                    except Exception as e:
+                        _log("warning", f"[/download] ✗ Failed to write decoded fallback cookies to temp file: {e}")
+                else:
+                    # Use file directly (raw Netscape format)
+                    cookiefile_path = FALLBACK_COOKIES_FILE
+                    cookie_source = "file"
+                    _log("info", f"[/download] ✓ Using fallback cookie file: {fallback_abs_path} ({format_desc}, size={len(decoded_content)}B)")
+            else:
+                _log("warning", f"[/download] ✗ Fallback cookie file invalid: {format_desc}. File will NOT be used.")
         else:
             _log("info", f"[/download] Fallback cookie file does not exist at: {fallback_abs_path}")
         
@@ -902,18 +1017,32 @@ def download():
             if env_cookie_path:
                 env_abs_path = os.path.abspath(env_cookie_path)
                 _log("info", f"[/download] Checking env cookie file: {env_abs_path}")
-                exists, size, first_line, is_net, reason = _preview_cookies_file(env_cookie_path)
-                sanitized_first = first_line[:80] + ('...' if len(first_line) > 80 else '')
-                _log("info", f"[/download] Env file check: exists={exists}, size={size}B, is_netscape={is_net}, first_line='{sanitized_first}'")
                 
-                if exists and is_net:
-                    cookiefile_path = env_cookie_path
-                    cookie_source = "env"
-                    _log("info", f"[/download] ✓ Using validated env cookie file: {env_abs_path} (size={size} bytes, format=Netscape)")
-                elif exists and not is_net:
-                    _log("warning", f"[/download] ✗ Env cookie file exists but INVALID format: {reason}. File will NOT be used.")
+                decoded_content, format_desc = _read_cookies_file(env_cookie_path)
+                
+                if decoded_content:
+                    if "base64-decoded" in format_desc:
+                        # Write decoded content to temp file
+                        try:
+                            with tempfile.NamedTemporaryFile(prefix="ydl_cookies_env_", suffix=".txt", delete=False) as tf:
+                                try:
+                                    os.chmod(tf.name, 0o600)
+                                except Exception:
+                                    pass
+                                tf.write(decoded_content)
+                                cookiefile_path = tf.name
+                                delete_tmp_cookiefile = True
+                                cookie_source = "env_b64"
+                                _log("info", f"[/download] ✓ Using env cookie file: {env_abs_path} ({format_desc}, size={len(decoded_content)}B, written to temp: {cookiefile_path})")
+                        except Exception as e:
+                            _log("warning", f"[/download] ✗ Failed to write decoded env cookies to temp file: {e}")
+                    else:
+                        # Use file directly
+                        cookiefile_path = env_cookie_path
+                        cookie_source = "env"
+                        _log("info", f"[/download] ✓ Using env cookie file: {env_abs_path} ({format_desc}, size={len(decoded_content)}B)")
                 else:
-                    _log("warning", f"[/download] ✗ Env cookie file not readable: {reason}")
+                    _log("warning", f"[/download] ✗ Env cookie file invalid: {format_desc}. File will NOT be used.")
             else:
                 _log("info", "[/download] No YTDLP_COOKIES_FILE environment variable set")
 
@@ -1212,19 +1341,33 @@ def download_post():
         _log("info", f"[POST /download] Checking fallback cookie file: {fallback_abs_path}")
         
         if os.path.exists(FALLBACK_COOKIES_FILE):
-            exists, size, first_line, is_net, reason = _preview_cookies_file(FALLBACK_COOKIES_FILE)
-            # Sanitize first_line to avoid leaking full cookie values (show only first 80 chars)
-            sanitized_first = first_line[:80] + ('...' if len(first_line) > 80 else '')
-            _log("info", f"[POST /download] Fallback file check: exists={exists}, size={size}B, is_netscape={is_net}, first_line='{sanitized_first}'")
+            # Use enhanced reader that detects and decodes base64
+            decoded_content, format_desc = _read_cookies_file(FALLBACK_COOKIES_FILE)
             
-            if exists and is_net:
-                cookiefile_path = FALLBACK_COOKIES_FILE
-                cookie_source = "file"
-                _log("info", f"[POST /download] ✓ Using validated fallback cookie file: {fallback_abs_path} (size={size} bytes, format=Netscape)")
-            elif exists and not is_net:
-                _log("warning", f"[POST /download] ✗ Fallback cookie file exists but INVALID format: {reason}. File will NOT be used.")
-            elif not exists:
-                _log("warning", f"[POST /download] ✗ Fallback cookie file not readable: {reason}")
+            if decoded_content:
+                # Content is valid - check if we need to write to temp file or use directly
+                if "base64-decoded" in format_desc:
+                    # Write decoded content to temp file
+                    try:
+                        with tempfile.NamedTemporaryFile(prefix="ydl_cookies_fallback_", suffix=".txt", delete=False) as tf:
+                            try:
+                                os.chmod(tf.name, 0o600)
+                            except Exception:
+                                pass
+                            tf.write(decoded_content)
+                            cookiefile_path = tf.name
+                            delete_tmp_cookiefile = True
+                            cookie_source = "file_b64"
+                            _log("info", f"[POST /download] ✓ Using fallback cookie file: {fallback_abs_path} ({format_desc}, size={len(decoded_content)}B, written to temp: {cookiefile_path})")
+                    except Exception as e:
+                        _log("warning", f"[POST /download] ✗ Failed to write decoded fallback cookies to temp file: {e}")
+                else:
+                    # Use file directly (raw Netscape format)
+                    cookiefile_path = FALLBACK_COOKIES_FILE
+                    cookie_source = "file"
+                    _log("info", f"[POST /download] ✓ Using fallback cookie file: {fallback_abs_path} ({format_desc}, size={len(decoded_content)}B)")
+            else:
+                _log("warning", f"[POST /download] ✗ Fallback cookie file invalid: {format_desc}. File will NOT be used.")
         else:
             _log("info", f"[POST /download] Fallback cookie file does not exist at: {fallback_abs_path}")
         
@@ -1234,18 +1377,32 @@ def download_post():
             if env_cookie_path:
                 env_abs_path = os.path.abspath(env_cookie_path)
                 _log("info", f"[POST /download] Checking env cookie file: {env_abs_path}")
-                exists, size, first_line, is_net, reason = _preview_cookies_file(env_cookie_path)
-                sanitized_first = first_line[:80] + ('...' if len(first_line) > 80 else '')
-                _log("info", f"[POST /download] Env file check: exists={exists}, size={size}B, is_netscape={is_net}, first_line='{sanitized_first}'")
                 
-                if exists and is_net:
-                    cookiefile_path = env_cookie_path
-                    cookie_source = "env"
-                    _log("info", f"[POST /download] ✓ Using validated env cookie file: {env_abs_path} (size={size} bytes, format=Netscape)")
-                elif exists and not is_net:
-                    _log("warning", f"[POST /download] ✗ Env cookie file exists but INVALID format: {reason}. File will NOT be used.")
+                decoded_content, format_desc = _read_cookies_file(env_cookie_path)
+                
+                if decoded_content:
+                    if "base64-decoded" in format_desc:
+                        # Write decoded content to temp file
+                        try:
+                            with tempfile.NamedTemporaryFile(prefix="ydl_cookies_env_", suffix=".txt", delete=False) as tf:
+                                try:
+                                    os.chmod(tf.name, 0o600)
+                                except Exception:
+                                    pass
+                                tf.write(decoded_content)
+                                cookiefile_path = tf.name
+                                delete_tmp_cookiefile = True
+                                cookie_source = "env_b64"
+                                _log("info", f"[POST /download] ✓ Using env cookie file: {env_abs_path} ({format_desc}, size={len(decoded_content)}B, written to temp: {cookiefile_path})")
+                        except Exception as e:
+                            _log("warning", f"[POST /download] ✗ Failed to write decoded env cookies to temp file: {e}")
+                    else:
+                        # Use file directly
+                        cookiefile_path = env_cookie_path
+                        cookie_source = "env"
+                        _log("info", f"[POST /download] ✓ Using env cookie file: {env_abs_path} ({format_desc}, size={len(decoded_content)}B)")
                 else:
-                    _log("warning", f"[POST /download] ✗ Env cookie file not readable: {reason}")
+                    _log("warning", f"[POST /download] ✗ Env cookie file invalid: {format_desc}. File will NOT be used.")
             else:
                 _log("info", "[POST /download] No YTDLP_COOKIES_FILE environment variable set")
 
