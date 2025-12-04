@@ -731,9 +731,11 @@ def summarize():
     transcript_text = ""
     try:
         client = Groq()
+        filename = os.path.basename(mp3_path)
         with open(mp3_path, "rb") as f:
+            file_bytes = f.read()
             transcription = client.audio.transcriptions.create(
-                file=(mp3_path, f.read()),
+                file=(filename, file_bytes),
                 model="whisper-large-v3",
                 temperature=0,
                 response_format="verbose_json",
@@ -743,7 +745,7 @@ def summarize():
         if not transcript_text:
             return {"error": "Transcription failed: empty transcript."}, 500
     except Exception as e:
-        _log("error", f"[/summarize] Transcription error: {str(e)}")
+        _log("error", f"[/summarize] Groq Whisper transcription error: {str(e)}")
         # Clean temp cookie if created
         if delete_tmp_cookiefile and cookiefile_path:
             try:
@@ -752,7 +754,11 @@ def summarize():
                     _log("info", f"[/summarize] Cleaned up temp cookie file after transcription error: {cookiefile_path}")
             except Exception:
                 pass
-        return {"error": f"Transcription error: {str(e)}"}, 500
+        return {
+            "error": "Groq transcription service unavailable or failed.",
+            "details": str(e),
+            "action": "Verify GROQ_API_KEY is set correctly and Groq service is accessible."
+        }, 502
 
     # Build prompt and summarize with gpt-oss-20b
     def _chunk_text(txt: str, max_len: int = 8000):
@@ -808,8 +814,12 @@ def summarize():
             "full_transcript": transcript_text,
         }, 200
     except Exception as e:
-        _log("error", f"[/summarize] Summarization error: {str(e)}")
-        return {"error": f"Summarization error: {str(e)}"}, 500
+        _log("error", f"[/summarize] Groq summarization error: {str(e)}")
+        return {
+            "error": "Groq summarization service unavailable or failed.",
+            "details": str(e),
+            "action": "Verify GROQ_API_KEY is set correctly and Groq service is accessible."
+        }, 502
     finally:
         # cleanup temp cookie if created by helper
         if delete_tmp_cookiefile and cookiefile_path:
