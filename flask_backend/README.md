@@ -7,10 +7,48 @@ A Flask-based REST API for YouTube video processing, search, and MP3 conversion 
 - YouTube video search (limited to videos ≤ 5 minutes)
 - YouTube audio download as MP3 with cookie support
 - Audio streaming with HTTP Range support (206 Partial Content)
-- Transcription using Groq Whisper
-- AI-powered summarization using Groq GPT
+- Transcription using Groq Whisper via OpenAI client
+- AI-powered summarization using Groq LLaMA via OpenAI client
 - Rate limiting and CORS support
 - OpenAPI/Swagger documentation at `/docs`
+
+## Groq Integration via OpenAI Client
+
+This service uses the **OpenAI Python SDK** to interact with Groq's API endpoints. This approach:
+
+- **Avoids proxy initialization issues** that occur with the native Groq SDK
+- Uses Groq's OpenAI-compatible API endpoint: `https://api.groq.com/openai/v1`
+- Requires only the `GROQ_API_KEY` environment variable (no additional configuration)
+- Maintains full compatibility with Groq's Whisper and LLaMA models
+
+**Implementation:**
+```python
+from openai import OpenAI
+
+# Initialize client with Groq base URL
+client = OpenAI(
+    base_url="https://api.groq.com/openai/v1",
+    api_key=os.getenv("GROQ_API_KEY")
+)
+
+# Transcription (Whisper)
+transcription = client.audio.transcriptions.create(
+    file=(filename, file_bytes),
+    model="whisper-large-v3",
+    temperature=0,
+    response_format="verbose_json"
+)
+
+# Summarization (LLaMA)
+completion = client.chat.completions.create(
+    model="llama-3.3-70b-versatile",
+    messages=[{"role": "user", "content": prompt}],
+    temperature=0.7,
+    max_tokens=1500
+)
+```
+
+This pattern eliminates the need for proxy workarounds while providing a clean, maintainable integration.
 
 ## Requirements
 
@@ -43,7 +81,7 @@ All Python dependencies are listed in `requirements.txt`:
 - flask-limiter for rate limiting
 - yt-dlp for YouTube downloading
 - pydub for audio processing
-- groq for AI transcription and summarization
+- openai (>= 1.0.0) for AI transcription and summarization via Groq API
 - python-dotenv for environment variable management
 - youtubesearchpython for YouTube search
 
@@ -60,6 +98,9 @@ Configuration is managed via `.env` file in the flask_backend directory:
 
 **Required:**
 - `GROQ_API_KEY` - API key for Groq services (transcription and summarization)
+  - The API uses the OpenAI Python client configured to point to Groq's OpenAI-compatible endpoint
+  - Base URL: `https://api.groq.com/openai/v1`
+  - This approach eliminates proxy initialization issues while maintaining full compatibility with Groq services
 
 **Optional:**
 - `PORT` - Server port (default: 3001)

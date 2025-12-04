@@ -12,7 +12,7 @@ from flask_smorest import Blueprint
 from youtubesearchpython import VideosSearch
 from yt_dlp import YoutubeDL
 from pydub import AudioSegment
-from groq import Groq
+from openai import OpenAI
 import json
 
 # Import the global limiter instance from the app package
@@ -766,20 +766,23 @@ def summarize():
         _log("error", f"[/summarize] Unhandled exception in download: {str(e)}")
         return {"error": f"Download failed: {str(e)}"}, 500
 
-    # Transcribe with Groq Whisper
+    # Transcribe with OpenAI client pointing to Groq API
     transcript_text = ""
     try:
-        # Log Groq client initialization with environment check
+        # Log OpenAI client initialization with environment check
         groq_api_key = os.getenv("GROQ_API_KEY")
         if groq_api_key:
             _log("info", f"[/summarize] GROQ_API_KEY present: {groq_api_key[:8]}...{groq_api_key[-4:] if len(groq_api_key) > 12 else '***'}")
         else:
             _log("warning", "[/summarize] GROQ_API_KEY not found in environment")
         
-        # Log call site for debugging
-        _log("info", "[/summarize] Initializing Groq() - Whisper transcription - NO kwargs, no proxies, using env GROQ_API_KEY")
-        client = Groq()
-        _log("info", f"[/summarize] ✓ Groq Whisper client initialized: {type(client).__name__}")
+        # Initialize OpenAI client with Groq base URL
+        _log("info", "[/summarize] Initializing OpenAI client with Groq base_url for Whisper transcription")
+        client = OpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=groq_api_key
+        )
+        _log("info", f"[/summarize] ✓ OpenAI client (Groq) initialized: {type(client).__name__}")
         
         filename = os.path.basename(mp3_path)
         with open(mp3_path, "rb") as f:
@@ -795,7 +798,7 @@ def summarize():
         if not transcript_text:
             return {"error": "Transcription failed: empty transcript."}, 500
     except Exception as e:
-        _log("error", f"[/summarize] Groq Whisper transcription error: {str(e)}")
+        _log("error", f"[/summarize] OpenAI/Groq Whisper transcription error: {str(e)}")
         # Clean temp cookie if created
         if delete_tmp_cookiefile and cookiefile_path:
             try:
@@ -822,10 +825,13 @@ def summarize():
         return chunks
 
     try:
-        # Log call site for debugging
-        _log("info", "[/summarize] Initializing Groq() - GPT summarization - NO kwargs, no proxies, using env GROQ_API_KEY")
-        client = Groq()
-        _log("info", f"[/summarize] ✓ Groq GPT client initialized: {type(client).__name__}")
+        # Initialize OpenAI client with Groq base URL for summarization
+        _log("info", "[/summarize] Initializing OpenAI client with Groq base_url for GPT summarization")
+        client = OpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=os.getenv("GROQ_API_KEY")
+        )
+        _log("info", f"[/summarize] ✓ OpenAI client (Groq) GPT initialized: {type(client).__name__}")
         
         # If transcript very large, include only first chunk to stay within token limits
         chunks = _chunk_text(transcript_text, 8000)
@@ -837,10 +843,10 @@ def summarize():
             f"Transcript:\n{chunks[0]}"
         )
         completion = client.chat.completions.create(
-            model="openai/gpt-oss-20b",
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
-            max_completion_tokens=1500,
+            max_tokens=1500,
             top_p=1,
         )
         content = completion.choices[0].message.content if completion and completion.choices else ""
@@ -868,7 +874,7 @@ def summarize():
             "full_transcript": transcript_text,
         }, 200
     except Exception as e:
-        _log("error", f"[/summarize] Groq summarization error: {str(e)}")
+        _log("error", f"[/summarize] OpenAI/Groq summarization error: {str(e)}")
         return {
             "error": "Groq summarization service unavailable or failed.",
             "details": str(e),

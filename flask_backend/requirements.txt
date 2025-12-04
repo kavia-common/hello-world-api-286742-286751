@@ -28,6 +28,7 @@ pydub==0.25.1
 pytube==12.1.0
 youtube-search-python
 flask-limiter==2.8.1
-groq==0.12.0
 # Load environment variables from .env file
 python-dotenv==1.0.1
+# OpenAI client for Groq API (replaces groq SDK)
+openai>=1.0.0
