@@ -105,7 +105,7 @@ def _preview_cookies_content(content: bytes) -> Tuple[bool, str, str]:
 def _read_cookies_file(path: str) -> Tuple[Optional[bytes], str]:
     """
     Read a cookie file and return (decoded_content, format_description).
-    Automatically detects and decodes base64-encoded content.
+    Automatically detects and decodes base64-encoded content with padding fix.
     Returns (None, error_reason) on failure.
     """
     try:
@@ -115,9 +115,12 @@ def _read_cookies_file(path: str) -> Tuple[Optional[bytes], str]:
         with open(path, "rb") as f:
             content = f.read()
         
+        _log("info", f"[_read_cookies_file] Reading {path}, size={len(content)}B")
+        
         # First, try to interpret as-is
         is_net, first, reason = _preview_cookies_content(content)
         if is_net:
+            _log("info", "[_read_cookies_file] Detected raw Netscape format")
             return content, "raw Netscape format"
         
         # If not valid Netscape, check if it might be base64-encoded
@@ -127,27 +130,51 @@ def _read_cookies_file(path: str) -> Tuple[Optional[bytes], str]:
             if len(lines) <= 2:  # base64 might have one or two lines
                 b64_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r \t")
                 if set(text) <= b64_chars and len(text.strip()) > 0:
+                    _log("info", "[_read_cookies_file] Attempting base64 decode")
                     try:
                         decoded = base64.b64decode(text, validate=True)
                         is_net_decoded, first_decoded, reason_decoded = _preview_cookies_content(decoded)
                         if is_net_decoded:
+                            _log("info", "[_read_cookies_file] Successfully decoded base64 Netscape format")
                             return decoded, "base64-decoded Netscape format"
                         else:
+                            _log("warning", f"[_read_cookies_file] Base64 decoded but not valid Netscape: {reason_decoded}")
                             return None, f"File appears to be base64 but decoded content is not valid Netscape: {reason_decoded}"
                     except Exception as e:
-                        return None, f"File appears to be base64 but decoding failed: {str(e)}"
+                        # Try fixing padding
+                        _log("info", f"[_read_cookies_file] Base64 decode failed ({str(e)}), attempting padding fix")
+                        try:
+                            # Add padding if needed
+                            missing_padding = len(text) % 4
+                            if missing_padding:
+                                text += '=' * (4 - missing_padding)
+                                _log("info", f"[_read_cookies_file] Added {4 - missing_padding} padding characters")
+                            
+                            decoded = base64.b64decode(text, validate=True)
+                            is_net_decoded, first_decoded, reason_decoded = _preview_cookies_content(decoded)
+                            if is_net_decoded:
+                                _log("info", "[_read_cookies_file] Successfully decoded base64 after padding fix")
+                                return decoded, "base64-decoded Netscape format (padding fixed)"
+                            else:
+                                _log("warning", "[_read_cookies_file] Padding fix successful but content not valid Netscape")
+                                return None, f"File appears to be base64 but decoded content is not valid Netscape: {reason_decoded}"
+                        except Exception as e2:
+                            _log("error", f"[_read_cookies_file] Base64 decode failed even after padding fix: {str(e2)}")
+                            return None, f"File appears to be base64 but decoding failed: {str(e2)}"
         except Exception:
             pass
         
+        _log("warning", f"[_read_cookies_file] Could not detect valid format: {reason}")
         return None, reason
     except Exception as e:
+        _log("error", f"[_read_cookies_file] Error reading file: {str(e)}")
         return None, f"Error reading file: {str(e)}"
 
 
 def _preview_cookies_file(path: str, max_bytes: int = 4096) -> Tuple[bool, int, str, bool, str]:
     """
     Return (exists, size, first_line, is_netscape, reason) for a cookies file path.
-    Automatically detects and decodes base64-encoded Netscape cookies.
+    Automatically detects and decodes base64-encoded Netscape cookies with padding fix.
     """
     try:
         exists = os.path.isfile(path) and os.access(path, os.R_OK)
@@ -163,13 +190,10 @@ def _preview_cookies_file(path: str, max_bytes: int = 4096) -> Tuple[bool, int, 
             return True, size, first, is_net, reason
         
         # If not valid Netscape, check if it might be base64-encoded
-        # Heuristic: if content has no newlines and appears to be base64, try decoding
         try:
             text = content.decode("utf-8", errors="replace").strip()
-            # Check if it looks like base64: single line or minimal whitespace, only base64 chars
             lines = text.splitlines()
             if len(lines) <= 2:  # base64 might have one or two lines
-                # Check if predominantly base64 characters
                 b64_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r \t")
                 if set(text) <= b64_chars and len(text.strip()) > 0:
                     # Attempt base64 decode
@@ -181,8 +205,19 @@ def _preview_cookies_file(path: str, max_bytes: int = 4096) -> Tuple[bool, int, 
                         else:
                             return True, size, first, False, f"File appears to be base64 but decoded content is not valid Netscape: {reason_decoded}"
                     except Exception:
-                        # Not valid base64 or decode failed
-                        pass
+                        # Try fixing padding
+                        try:
+                            missing_padding = len(text) % 4
+                            if missing_padding:
+                                text += '=' * (4 - missing_padding)
+                            decoded = base64.b64decode(text, validate=True)
+                            is_net_decoded, first_decoded, reason_decoded = _preview_cookies_content(decoded)
+                            if is_net_decoded:
+                                return True, size, first_decoded, is_net_decoded, "base64-decoded Netscape format (padding fixed)"
+                            else:
+                                return True, size, first, False, f"Base64 padding fixed but content not valid Netscape: {reason_decoded}"
+                        except Exception:
+                            pass
         except Exception:
             pass
         
@@ -734,16 +769,17 @@ def summarize():
     # Transcribe with Groq Whisper
     transcript_text = ""
     try:
-        # Log Groq client initialization - DEBUGGING proxies issue
+        # Log Groq client initialization with environment check
         groq_api_key = os.getenv("GROQ_API_KEY")
         if groq_api_key:
             _log("info", f"[/summarize] GROQ_API_KEY present: {groq_api_key[:8]}...{groq_api_key[-4:] if len(groq_api_key) > 12 else '***'}")
         else:
             _log("warning", "[/summarize] GROQ_API_KEY not found in environment")
         
-        _log("info", "[/summarize] Initializing Groq client with NO kwargs (using env GROQ_API_KEY only)")
+        # Log call site for debugging
+        _log("info", "[/summarize] Initializing Groq() - Whisper transcription - NO kwargs, no proxies, using env GROQ_API_KEY")
         client = Groq()
-        _log("info", f"[/summarize] Groq client initialized successfully: {type(client).__name__}")
+        _log("info", f"[/summarize] ✓ Groq Whisper client initialized: {type(client).__name__}")
         
         filename = os.path.basename(mp3_path)
         with open(mp3_path, "rb") as f:
@@ -786,9 +822,10 @@ def summarize():
         return chunks
 
     try:
-        _log("info", "[/summarize] Initializing Groq client for summarization (NO kwargs)")
+        # Log call site for debugging
+        _log("info", "[/summarize] Initializing Groq() - GPT summarization - NO kwargs, no proxies, using env GROQ_API_KEY")
         client = Groq()
-        _log("info", f"[/summarize] Groq summarization client initialized: {type(client).__name__}")
+        _log("info", f"[/summarize] ✓ Groq GPT client initialized: {type(client).__name__}")
         
         # If transcript very large, include only first chunk to stay within token limits
         chunks = _chunk_text(transcript_text, 8000)
