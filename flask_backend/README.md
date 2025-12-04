@@ -257,21 +257,48 @@ python run.py
 
 ### Cookie Source Logging
 
-The application logs which cookie source is being used for each request:
-- `cookie_source=provided_b64` - Using cookies from request body/header
+The application provides detailed logging for cookie file discovery, validation, and usage. This helps troubleshoot authentication issues and verify cookie file setup.
+
+**Log output includes:**
+- Absolute path resolution for `./cookie/cookies.txt` relative to flask_backend root
+- File existence check and file size in bytes
+- First non-comment line (sanitized to 80 characters to avoid leaking secrets)
+- Netscape format validation with specific warnings if header is missing
+- Confirmation when cookiefile is passed to yt-dlp
+- Temporary cookiefile path and automatic cleanup confirmation
+
+**Cookie source indicators:**
+- `cookie_source=provided_b64` - Using cookies from request body/header (via cookies_b64 or X-YTDLP-Cookies)
 - `cookie_source=file` - Using fallback file (./cookie/cookies.txt)
 - `cookie_source=env` - Using environment variable (YTDLP_COOKIES_FILE)
 - `cookie_source=none` - No cookies available
 
+**Example log output:**
+```
+[INFO] [download] Checking fallback cookie file: /app/flask_backend/cookie/cookies.txt
+[INFO] [download] Fallback file check: exists=True, size=1024B, is_netscape=True, first_line='# Netscape HTTP Cookie File...'
+[INFO] [download] ✓ Using validated fallback cookie file: /app/flask_backend/cookie/cookies.txt (size=1024 bytes, format=Netscape)
+[INFO] [download] → Passing cookiefile to yt-dlp probe: /app/flask_backend/cookie/cookies.txt
+[INFO] [download] Probing URL with cookie_source=file, cookiefile=set
+```
+
+**Security notes on logging:**
+- Cookie values are never logged in full
+- First lines are truncated to 80 characters to prevent secret leakage
+- Temporary files use secure permissions (0600) and are logged when created/deleted
+- File paths are logged to help verify correct resolution
+
 ### Important Cookie Notes
 
-1. **Fallback file location**: The `./cookie/cookies.txt` path is relative to the flask_backend container root (where run.py is located), not the working directory
+1. **Fallback file location**: The `./cookie/cookies.txt` path is relative to the flask_backend container root (where run.py is located), not the working directory. Absolute path is logged for verification.
 2. **Directory creation**: The `cookie/` directory will be created automatically if it doesn't exist
 3. **Cookie freshness**: YouTube cookies can expire. If you get authentication errors, refresh your cookies
-4. **Security**: Temporary cookie files created from base64 input are automatically deleted after each request
-5. **Format validation**: The API validates that cookies are in Netscape format and will reject invalid formats with helpful error messages
+4. **Security**: Temporary cookie files created from base64 input are automatically deleted after each request and logged
+5. **Format validation**: The API validates that cookies are in Netscape format and will reject invalid formats with helpful error messages. Missing format headers are specifically warned.
 6. **Base64 encoding**: Only encode the cookies.txt file once - do not double-encode
 7. **No cookies needed for public videos**: Most public YouTube videos work without cookies
+8. **Auth-required detection**: When yt-dlp returns errors containing keywords like "bot", "captcha", "sign in", "verify", or "login", the API returns 401/403 with clear guidance to provide cookies
+9. **Detailed logging**: All cookie operations (file checks, validation, yt-dlp handoff) are logged with sanitized output to help debug without exposing secrets
 
 ## File Management
 

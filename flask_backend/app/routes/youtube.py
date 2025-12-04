@@ -321,29 +321,54 @@ def _download_audio_to_local_mp3(url: str, cookies_b64: Optional[str], header_b6
                 cookiefile_path = tf.name
                 delete_tmp_cookiefile = True
                 cookie_source = "provided_b64"
-                _log("info", f"[download] Created temp cookie file: {cookiefile_path} (size={len(decoded)} bytes)")
+                temp_abs_path = os.path.abspath(cookiefile_path)
+                sanitized_first = first_line[:80] + ('...' if len(first_line) > 80 else '')
+                _log("info", f"[download] ✓ Created secure temp cookie file: {temp_abs_path} (size={len(decoded)}B, permissions=0600, first_line='{sanitized_first}')")
+                _log("info", "[download] Temp cookie file will be passed to yt-dlp and deleted after request completes")
         except Exception as e:
             return None, {"error": f"Failed to create temporary cookie file: {e}"}, None, None, None
     else:
-        # Try fallback file first
+        # Try fallback file first - resolve absolute path
+        fallback_abs_path = os.path.abspath(FALLBACK_COOKIES_FILE)
+        _log("info", f"[download] Checking fallback cookie file: {fallback_abs_path}")
+        
         if os.path.exists(FALLBACK_COOKIES_FILE):
             exists, size, first_line, is_net, reason = _preview_cookies_file(FALLBACK_COOKIES_FILE)
+            # Sanitize first_line to avoid leaking full cookie values (show only first 80 chars)
+            sanitized_first = first_line[:80] + ('...' if len(first_line) > 80 else '')
+            _log("info", f"[download] Fallback file check: exists={exists}, size={size}B, is_netscape={is_net}, first_line='{sanitized_first}'")
+            
             if exists and is_net:
                 cookiefile_path = FALLBACK_COOKIES_FILE
                 cookie_source = "file"
-                _log("info", f"[download] Using fallback cookie file: {FALLBACK_COOKIES_FILE} (size={size} bytes)")
-            elif exists:
-                _log("warning", f"[download] Fallback cookie file exists but invalid format: {reason}")
+                _log("info", f"[download] ✓ Using validated fallback cookie file: {fallback_abs_path} (size={size} bytes, format=Netscape)")
+            elif exists and not is_net:
+                _log("warning", f"[download] ✗ Fallback cookie file exists but INVALID format: {reason}. File will NOT be used.")
+            elif not exists:
+                _log("warning", f"[download] ✗ Fallback cookie file not readable: {reason}")
+        else:
+            _log("info", f"[download] Fallback cookie file does not exist at: {fallback_abs_path}")
         
         # Fall back to env if fallback file not available
         if not cookiefile_path:
             env_cookie_path = os.getenv("YTDLP_COOKIES_FILE")
             if env_cookie_path:
+                env_abs_path = os.path.abspath(env_cookie_path)
+                _log("info", f"[download] Checking env cookie file: {env_abs_path}")
                 exists, size, first_line, is_net, reason = _preview_cookies_file(env_cookie_path)
+                sanitized_first = first_line[:80] + ('...' if len(first_line) > 80 else '')
+                _log("info", f"[download] Env file check: exists={exists}, size={size}B, is_netscape={is_net}, first_line='{sanitized_first}'")
+                
                 if exists and is_net:
                     cookiefile_path = env_cookie_path
                     cookie_source = "env"
-                    _log("info", f"[download] Using env cookie file: {env_cookie_path} (size={size} bytes)")
+                    _log("info", f"[download] ✓ Using validated env cookie file: {env_abs_path} (size={size} bytes, format=Netscape)")
+                elif exists and not is_net:
+                    _log("warning", f"[download] ✗ Env cookie file exists but INVALID format: {reason}. File will NOT be used.")
+                else:
+                    _log("warning", f"[download] ✗ Env cookie file not readable: {reason}")
+            else:
+                _log("info", "[download] No YTDLP_COOKIES_FILE environment variable set")
 
     # Probe with enhanced options
     ydl_probe_opts = {
@@ -354,6 +379,7 @@ def _download_audio_to_local_mp3(url: str, cookies_b64: Optional[str], header_b6
     }
     if cookiefile_path:
         ydl_probe_opts["cookiefile"] = cookiefile_path
+        _log("info", f"[download] → Passing cookiefile to yt-dlp probe: {os.path.abspath(cookiefile_path)}")
     
     _log("info", f"[download] Probing URL with cookie_source={cookie_source}, cookiefile={'set' if cookiefile_path else 'none'}")
     
@@ -366,6 +392,7 @@ def _download_audio_to_local_mp3(url: str, cookies_b64: Optional[str], header_b6
             try:
                 if os.path.exists(cookiefile_path):
                     os.remove(cookiefile_path)
+                    _log("info", f"[download] Cleaned up temp cookie file after probe error: {cookiefile_path}")
             except Exception:
                 pass
         error_msg = str(e)
@@ -423,6 +450,7 @@ def _download_audio_to_local_mp3(url: str, cookies_b64: Optional[str], header_b6
     }
     if cookiefile_path:
         ydl_opts["cookiefile"] = cookiefile_path
+        _log("info", f"[download] → Passing cookiefile to yt-dlp download: {os.path.abspath(cookiefile_path)}")
 
     _log("info", f"[download] Starting download for video_id={video_id} with cookie_source={cookie_source}")
 
@@ -579,6 +607,7 @@ def summarize():
                 try:
                     if os.path.exists(cookiefile_path):
                         os.remove(cookiefile_path)
+                        _log("info", f"[/summarize] Cleaned up temp cookie file: {cookiefile_path}")
                 except Exception:
                     pass
             # Determine appropriate status code based on error type
@@ -619,6 +648,7 @@ def summarize():
             try:
                 if os.path.exists(cookiefile_path):
                     os.remove(cookiefile_path)
+                    _log("info", f"[/summarize] Cleaned up temp cookie file after transcription error: {cookiefile_path}")
             except Exception:
                 pass
         return {"error": f"Transcription error: {str(e)}"}, 500
@@ -685,6 +715,7 @@ def summarize():
             try:
                 if os.path.exists(cookiefile_path):
                     os.remove(cookiefile_path)
+                    _log("info", f"[/summarize] ✓ Cleaned up temp cookie file: {cookiefile_path}")
             except Exception:
                 pass
 
@@ -839,35 +870,52 @@ def download():
                 cookie_source = "header"
                 exists = os.path.isfile(cookiefile_path)
                 size = os.path.getsize(cookiefile_path) if exists else 0
-                _log("info", f"[/download] Header cookies temp file: {cookiefile_path} exists={exists} size={size}B first='{first_line[:120]}'")
+                sanitized_first = first_line[:80] + ('...' if len(first_line) > 80 else '')
+                _log("info", f"[/download] ✓ Header cookies temp file: {cookiefile_path} exists={exists} size={size}B first='{sanitized_first}'")
         except Exception as e:
             return {"error": f"Failed to create temporary cookie file: {e}"}, 500
     else:
-        # Try fallback file first
+        # Try fallback file first - resolve absolute path
+        fallback_abs_path = os.path.abspath(FALLBACK_COOKIES_FILE)
+        _log("info", f"[/download] Checking fallback cookie file: {fallback_abs_path}")
+        
         if os.path.exists(FALLBACK_COOKIES_FILE):
             exists, size, first_line, is_net, reason = _preview_cookies_file(FALLBACK_COOKIES_FILE)
+            # Sanitize first_line to avoid leaking full cookie values (show only first 80 chars)
+            sanitized_first = first_line[:80] + ('...' if len(first_line) > 80 else '')
+            _log("info", f"[/download] Fallback file check: exists={exists}, size={size}B, is_netscape={is_net}, first_line='{sanitized_first}'")
+            
             if exists and is_net:
                 cookiefile_path = FALLBACK_COOKIES_FILE
                 cookie_source = "file"
-                _log("info", f"[/download] Using fallback cookie file: {FALLBACK_COOKIES_FILE} (size={size} bytes)")
-            elif exists:
-                _log("warning", f"[/download] Fallback cookie file exists but invalid format: {reason}")
+                _log("info", f"[/download] ✓ Using validated fallback cookie file: {fallback_abs_path} (size={size} bytes, format=Netscape)")
+            elif exists and not is_net:
+                _log("warning", f"[/download] ✗ Fallback cookie file exists but INVALID format: {reason}. File will NOT be used.")
+            elif not exists:
+                _log("warning", f"[/download] ✗ Fallback cookie file not readable: {reason}")
+        else:
+            _log("info", f"[/download] Fallback cookie file does not exist at: {fallback_abs_path}")
         
         # Fallback to server-side cookies file via environment variable
         if not cookiefile_path:
             env_cookie_path = os.getenv("YTDLP_COOKIES_FILE")
             if env_cookie_path:
+                env_abs_path = os.path.abspath(env_cookie_path)
+                _log("info", f"[/download] Checking env cookie file: {env_abs_path}")
                 exists, size, first_line, is_net, reason = _preview_cookies_file(env_cookie_path)
-                _log("info", f"[/download] Env YTDLP_COOKIES_FILE='{env_cookie_path}' exists={exists} size={size}B first='{first_line[:120]}' netscape={is_net} reason='{reason}'")
-                if exists:
-                    if is_net:
-                        cookiefile_path = env_cookie_path
-                        cookie_source = "env"
-                    else:
-                        # Log and ignore invalid env cookie file; continue without cookies.
-                        _log("warning", f"[/download] Env cookies file found but format invalid; ignoring. reason='{reason}'")
+                sanitized_first = first_line[:80] + ('...' if len(first_line) > 80 else '')
+                _log("info", f"[/download] Env file check: exists={exists}, size={size}B, is_netscape={is_net}, first_line='{sanitized_first}'")
+                
+                if exists and is_net:
+                    cookiefile_path = env_cookie_path
+                    cookie_source = "env"
+                    _log("info", f"[/download] ✓ Using validated env cookie file: {env_abs_path} (size={size} bytes, format=Netscape)")
+                elif exists and not is_net:
+                    _log("warning", f"[/download] ✗ Env cookie file exists but INVALID format: {reason}. File will NOT be used.")
                 else:
-                    _log("warning", "[/download] YTDLP_COOKIES_FILE set but file does not exist or is not readable; continuing without cookies.")
+                    _log("warning", f"[/download] ✗ Env cookie file not readable: {reason}")
+            else:
+                _log("info", "[/download] No YTDLP_COOKIES_FILE environment variable set")
 
     # Probe metadata first to enforce duration limit
     ydl_probe_opts = {
@@ -878,6 +926,8 @@ def download():
     }
     if cookiefile_path:
         ydl_probe_opts["cookiefile"] = cookiefile_path
+        _log("info", f"[/download] → Passing cookiefile to yt-dlp probe: {os.path.abspath(cookiefile_path)}")
+    
     _log("info", f"[/download] yt-dlp probe opts cookiefile={ydl_probe_opts.get('cookiefile')} source={cookie_source}")
 
     try:
@@ -889,6 +939,7 @@ def download():
             try:
                 if os.path.exists(cookiefile_path):
                     os.remove(cookiefile_path)
+                    _log("info", f"[/download] Cleaned up temp cookie file after probe error: {cookiefile_path}")
             except Exception:
                 pass
         debug = {
@@ -953,6 +1004,8 @@ def download():
     }
     if cookiefile_path:
         ydl_opts["cookiefile"] = cookiefile_path
+        _log("info", f"[/download] → Passing cookiefile to yt-dlp download: {os.path.abspath(cookiefile_path)}")
+    
     _log("info", f"[/download] yt-dlp download opts cookiefile={ydl_opts.get('cookiefile')} source={cookie_source}")
 
     try:
@@ -999,7 +1052,7 @@ def download():
             try:
                 if os.path.exists(cookiefile_path):
                     os.remove(cookiefile_path)
-                    _log("info", f"[/download] Deleted header temp cookies file: {cookiefile_path}")
+                    _log("info", f"[/download] ✓ Deleted header temp cookies file: {cookiefile_path}")
             except Exception:
                 # Silently ignore cleanup errors
                 pass
@@ -1149,35 +1202,52 @@ def download_post():
                 cookie_source = "body"
                 exists = os.path.isfile(cookiefile_path)
                 size = os.path.getsize(cookiefile_path) if exists else 0
-                _log("info", f"[POST /download] Body cookies temp file: {cookiefile_path} exists={exists} size={size}B first='{first_line[:120]}'")
+                sanitized_first = first_line[:80] + ('...' if len(first_line) > 80 else '')
+                _log("info", f"[POST /download] ✓ Body cookies temp file: {cookiefile_path} exists={exists} size={size}B first='{sanitized_first}'")
         except Exception as e:
             return {"error": f"Failed to create temporary cookie file: {e}"}, 500
     else:
-        # Try fallback file first
+        # Try fallback file first - resolve absolute path
+        fallback_abs_path = os.path.abspath(FALLBACK_COOKIES_FILE)
+        _log("info", f"[POST /download] Checking fallback cookie file: {fallback_abs_path}")
+        
         if os.path.exists(FALLBACK_COOKIES_FILE):
             exists, size, first_line, is_net, reason = _preview_cookies_file(FALLBACK_COOKIES_FILE)
+            # Sanitize first_line to avoid leaking full cookie values (show only first 80 chars)
+            sanitized_first = first_line[:80] + ('...' if len(first_line) > 80 else '')
+            _log("info", f"[POST /download] Fallback file check: exists={exists}, size={size}B, is_netscape={is_net}, first_line='{sanitized_first}'")
+            
             if exists and is_net:
                 cookiefile_path = FALLBACK_COOKIES_FILE
                 cookie_source = "file"
-                _log("info", f"[POST /download] Using fallback cookie file: {FALLBACK_COOKIES_FILE} (size={size} bytes)")
-            elif exists:
-                _log("warning", f"[POST /download] Fallback cookie file exists but invalid format: {reason}")
+                _log("info", f"[POST /download] ✓ Using validated fallback cookie file: {fallback_abs_path} (size={size} bytes, format=Netscape)")
+            elif exists and not is_net:
+                _log("warning", f"[POST /download] ✗ Fallback cookie file exists but INVALID format: {reason}. File will NOT be used.")
+            elif not exists:
+                _log("warning", f"[POST /download] ✗ Fallback cookie file not readable: {reason}")
+        else:
+            _log("info", f"[POST /download] Fallback cookie file does not exist at: {fallback_abs_path}")
         
         # Fallback to server-side cookies file via environment variable
         if not cookiefile_path:
             env_cookie_path = os.getenv("YTDLP_COOKIES_FILE")
             if env_cookie_path:
+                env_abs_path = os.path.abspath(env_cookie_path)
+                _log("info", f"[POST /download] Checking env cookie file: {env_abs_path}")
                 exists, size, first_line, is_net, reason = _preview_cookies_file(env_cookie_path)
-                _log("info", f"[POST /download] Env YTDLP_COOKIES_FILE='{env_cookie_path}' exists={exists} size={size}B first='{first_line[:120]}' netscape={is_net} reason='{reason}'")
-                if exists:
-                    if is_net:
-                        cookiefile_path = env_cookie_path
-                        cookie_source = "env"
-                    else:
-                        # Log and ignore invalid env cookie file; continue without cookies.
-                        _log("warning", f"[POST /download] Env cookies file found but format invalid; ignoring. reason='{reason}'")
+                sanitized_first = first_line[:80] + ('...' if len(first_line) > 80 else '')
+                _log("info", f"[POST /download] Env file check: exists={exists}, size={size}B, is_netscape={is_net}, first_line='{sanitized_first}'")
+                
+                if exists and is_net:
+                    cookiefile_path = env_cookie_path
+                    cookie_source = "env"
+                    _log("info", f"[POST /download] ✓ Using validated env cookie file: {env_abs_path} (size={size} bytes, format=Netscape)")
+                elif exists and not is_net:
+                    _log("warning", f"[POST /download] ✗ Env cookie file exists but INVALID format: {reason}. File will NOT be used.")
                 else:
-                    _log("warning", "[POST /download] YTDLP_COOKIES_FILE set but file does not exist or is not readable; continuing without cookies.")
+                    _log("warning", f"[POST /download] ✗ Env cookie file not readable: {reason}")
+            else:
+                _log("info", "[POST /download] No YTDLP_COOKIES_FILE environment variable set")
 
     # Probe metadata first to enforce duration limit
     ydl_probe_opts = {
@@ -1188,6 +1258,8 @@ def download_post():
     }
     if cookiefile_path:
         ydl_probe_opts["cookiefile"] = cookiefile_path
+        _log("info", f"[POST /download] → Passing cookiefile to yt-dlp probe: {os.path.abspath(cookiefile_path)}")
+    
     _log("info", f"[POST /download] yt-dlp probe opts cookiefile={ydl_probe_opts.get('cookiefile')} source={cookie_source}")
 
     try:
@@ -1199,6 +1271,7 @@ def download_post():
             try:
                 if os.path.exists(cookiefile_path):
                     os.remove(cookiefile_path)
+                    _log("info", f"[POST /download] Cleaned up temp cookie file after probe error: {cookiefile_path}")
             except Exception:
                 pass
         debug = {
@@ -1263,6 +1336,8 @@ def download_post():
     }
     if cookiefile_path:
         ydl_opts["cookiefile"] = cookiefile_path
+        _log("info", f"[POST /download] → Passing cookiefile to yt-dlp download: {os.path.abspath(cookiefile_path)}")
+    
     _log("info", f"[POST /download] yt-dlp download opts cookiefile={ydl_opts.get('cookiefile')} source={cookie_source}")
 
     try:
@@ -1308,7 +1383,7 @@ def download_post():
             try:
                 if os.path.exists(cookiefile_path):
                     os.remove(cookiefile_path)
-                    _log("info", f"[POST /download] Deleted body temp cookies file: {cookiefile_path}")
+                    _log("info", f"[POST /download] ✓ Deleted body temp cookies file: {cookiefile_path}")
             except Exception:
                 pass
 
