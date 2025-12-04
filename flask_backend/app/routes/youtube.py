@@ -262,12 +262,19 @@ def _download_audio_to_local_mp3(url: str, cookies_b64: Optional[str], header_b6
 
     Returns:
       (mp3_path, info, cookiefile_path, delete_tmp_cookiefile, cookie_source)
-      On failure, returns (None, {"error": ...}, cookiefile_path, delete_tmp_cookiefile, cookie_source)
+      On failure, returns (None, {"error": ..., "service_status": ...}, cookiefile_path, delete_tmp_cookiefile, cookie_source)
     """
     if shutil.which("ffmpeg") is None:
         return None, {
             "error": "FFmpeg is required but was not found on the system PATH.",
             "action": "Please install FFmpeg and ensure it is available on PATH.",
+            "service_status": "unavailable",
+            "tips": {
+                "debian_ubuntu": "sudo apt-get update && sudo apt-get install -y ffmpeg",
+                "macos_brew": "brew install ffmpeg",
+                "windows_choco": "choco install ffmpeg",
+                "windows_scoop": "scoop install ffmpeg",
+            },
         }, None, None, None
 
     cookiefile_path: Optional[str] = None
@@ -464,7 +471,7 @@ def summarize():
         - full_transcript (str)
 
     Errors:
-      400/401 for missing/invalid inputs, 422 for parsing errors, 500 for server issues (incl. missing GROQ_API_KEY).
+      400 for missing/invalid inputs, 422 for parsing errors, 500 for server issues, 503 for missing dependencies.
     """
     body = request.get_json(silent=True) or {}
     url = (body.get("url") or "").strip()
@@ -476,30 +483,55 @@ def summarize():
         # Require per design to mirror protected flow
         return {"error": "Missing required JSON field 'cookies_b64' (base64 Netscape cookies.txt)."}, 400
 
+    # Check ffmpeg availability early and return 503 if missing
+    if shutil.which("ffmpeg") is None:
+        return {
+            "error": "FFmpeg is required but was not found on the system PATH.",
+            "action": "Please install FFmpeg and ensure it is available on PATH.",
+            "service_status": "unavailable",
+            "tips": {
+                "debian_ubuntu": "sudo apt-get update && sudo apt-get install -y ffmpeg",
+                "macos_brew": "brew install ffmpeg",
+                "windows_choco": "choco install ffmpeg",
+                "windows_scoop": "scoop install ffmpeg",
+            },
+        }, 503
+
     # Ensure GROQ_API_KEY present
     if not os.getenv("GROQ_API_KEY"):
         return {
             "error": "Server misconfiguration: GROQ_API_KEY is not set.",
-            "action": "Set GROQ_API_KEY environment variable for Groq client authentication."
-        }, 500
+            "action": "Set GROQ_API_KEY environment variable for Groq client authentication.",
+            "service_status": "misconfigured"
+        }, 503
 
     # Reuse download logic to fetch local mp3 (with cookies delivered via body)
-    mp3_path, info, cookiefile_path, delete_tmp_cookiefile, _cookie_source = _download_audio_to_local_mp3(
-        url=url,
-        cookies_b64=cookies_b64,
-        header_b64=None
-    )
+    try:
+        mp3_path, info, cookiefile_path, delete_tmp_cookiefile, _cookie_source = _download_audio_to_local_mp3(
+            url=url,
+            cookies_b64=cookies_b64,
+            header_b64=None
+        )
 
-    # If error dict returned in 'info'
-    if mp3_path is None:
-        # Attempt cleanup of any temp cookie
-        if delete_tmp_cookiefile and cookiefile_path:
-            try:
-                if os.path.exists(cookiefile_path):
-                    os.remove(cookiefile_path)
-            except Exception:
-                pass
-        return info or {"error": "Unable to download audio."}, 400
+        # If error dict returned in 'info'
+        if mp3_path is None:
+            # Attempt cleanup of any temp cookie
+            if delete_tmp_cookiefile and cookiefile_path:
+                try:
+                    if os.path.exists(cookiefile_path):
+                        os.remove(cookiefile_path)
+                except Exception:
+                    pass
+            # Determine appropriate status code based on error type
+            error_msg = info.get("error", "").lower() if info else ""
+            if "ffmpeg" in error_msg:
+                return info, 503
+            elif any(x in error_msg for x in ["invalid", "format", "base64", "cookies"]):
+                return info, 400
+            return info or {"error": "Unable to download audio."}, 400
+    except Exception as e:
+        _log("error", f"[/summarize] Unhandled exception in download: {str(e)}")
+        return {"error": f"Download failed: {str(e)}"}, 500
 
     # Transcribe with Groq Whisper
     transcript_text = ""
@@ -517,6 +549,7 @@ def summarize():
         if not transcript_text:
             return {"error": "Transcription failed: empty transcript."}, 500
     except Exception as e:
+        _log("error", f"[/summarize] Transcription error: {str(e)}")
         # Clean temp cookie if created
         if delete_tmp_cookiefile and cookiefile_path:
             try:
@@ -562,10 +595,10 @@ def summarize():
         except Exception:
             # Attempt to salvage JSON by stripping surrounding text
             try:
-                start = content.find("{")
-                end = content.rfind("}")
-                if start != -1 and end != -1:
-                    data = json.loads(content[start:end + 1])
+                start_idx = content.find("{")
+                end_idx = content.rfind("}")
+                if start_idx != -1 and end_idx != -1:
+                    data = json.loads(content[start_idx:end_idx + 1])
             except Exception:
                 return {"error": "Failed to parse summarization JSON from model."}, 422
 
@@ -580,6 +613,7 @@ def summarize():
             "full_transcript": transcript_text,
         }, 200
     except Exception as e:
+        _log("error", f"[/summarize] Summarization error: {str(e)}")
         return {"error": f"Summarization error: {str(e)}"}, 500
     finally:
         # cleanup temp cookie if created by helper

@@ -16,8 +16,10 @@ In Swagger UI, the /download endpoints include:
 
 Getting started:
 - Dependencies are listed in flask_backend/requirements.txt
-- The service runs using flask_backend/run.py
-- The server binds to 0.0.0.0 and uses PORT env var if set, default 3001.
+- The service runs using flask_backend/run.py (production) or flask_backend/start.sh
+- The server binds to 0.0.0.0 and uses PORT env var if set, default 3001
+- For production stability: debug=False and use_reloader=False (configured in run.py)
+- Configuration via .env file in flask_backend directory
 
 Example:
 - Health: GET https://<host>:3001/
