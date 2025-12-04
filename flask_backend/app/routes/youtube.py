@@ -560,6 +560,279 @@ def download():
 
 
 # PUBLIC_INTERFACE
+@blp.route("/download", methods=["POST"])
+@limiter.limit("6 per minute")
+@blp.doc(
+    summary="Download YouTube audio as MP3 (<= 5 minutes) via JSON body.",
+    description="Accepts a JSON body with 'url' (required) and optional 'cookies_b64'. "
+                "If 'cookies_b64' is provided, it must be base64-encoded Netscape cookies.txt content "
+                "and will be written to a secure temporary file for this request, taking precedence over "
+                "the server-side YTDLP_COOKIES_FILE. The temporary file is deleted after the request.",
+    requestBody={
+        "required": True,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "required": ["url"],
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "YouTube video URL to download as MP3 (<= 5 minutes)",
+                            "example": "https://www.youtube.com/watch?v=abc123"
+                        },
+                        "cookies_b64": {
+                            "type": "string",
+                            "description": "Optional base64-encoded Netscape cookies.txt content for yt-dlp; takes precedence over YTDLP_COOKIES_FILE."
+                        }
+                    }
+                }
+            }
+        }
+    }
+)
+def download_post():
+    """Download YouTube audio as MP3 (<= 5 minutes) via POST JSON.
+
+    Body:
+        - url (str, required): YouTube video URL to download as MP3 (<= 5 minutes)
+        - cookies_b64 (str, optional): base64-encoded Netscape cookies.txt content. If provided,
+          it will be written to a secure temporary file for the duration of the request and used
+          by yt-dlp, taking precedence over YTDLP_COOKIES_FILE.
+
+    Returns:
+        tuple: (JSON dict, HTTP status code). On success, includes:
+            - img: Thumbnail URL.
+            - direct_link: The path to stream the MP3 (GET /audios/<filename>).
+            - expiration_timestamp: Unix epoch when the file will be deleted.
+
+    Error Handling:
+        - If 'url' is missing: 400 with message.
+        - If invalid base64 is supplied for 'cookies_b64': 400.
+        - If 'cookies_b64' content is not Netscape cookies.txt format: 400.
+        - If ffmpeg is not installed: 500 with actionable guidance.
+        - If video is too long (> 5 minutes): 400.
+        - If extraction/download fails: 400/500 with message.
+    """
+    body = request.get_json(silent=True) or {}
+    url = (body.get("url") or "").strip()
+    if not url:
+        return {"error": "Missing required JSON field 'url'."}, 400
+
+    # Validate ffmpeg availability early to provide a friendly message
+    if shutil.which("ffmpeg") is None:
+        return (
+            {
+                "error": "FFmpeg is required but was not found on the system PATH.",
+                "action": "Please install FFmpeg and ensure it is available on PATH.",
+                "tips": {
+                    "debian_ubuntu": "sudo apt-get update && sudo apt-get install -y ffmpeg",
+                    "macos_brew": "brew install ffmpeg",
+                    "windows_choco": "choco install ffmpeg",
+                    "windows_scoop": "scoop install ffmpeg",
+                },
+            },
+            500,
+        )
+
+    cookiefile_path: Optional[str] = None
+    delete_tmp_cookiefile: bool = False
+    cookie_source = "none"
+
+    # Read optional base64-encoded Netscape cookies from JSON body (takes precedence)
+    cookies_b64 = body.get("cookies_b64")
+    if cookies_b64:
+        _log("info", "[POST /download] Using cookies from JSON body. Decoding and validating format.")
+        try:
+            decoded = base64.b64decode(cookies_b64, validate=True)
+        except Exception:
+            return {
+                "error": "Invalid base64 in 'cookies_b64'.",
+                "guidance": "Pass base64-encoded Netscape cookies.txt text. Do not base64-encode base64 again.",
+                "link": "https://github.com/yt-dlp/yt-dlp#how-do-i-pass-cookies",
+            }, 400
+
+        # Validate Netscape format before writing
+        is_net, first_line, reason = _preview_cookies_content(decoded)
+        if not is_net:
+            return {
+                "error": "'cookies_b64' is not Netscape cookies.txt format.",
+                "reason": reason,
+                "preview_first_line": first_line,
+                "guidance": "Export cookies as Netscape-format cookies.txt (e.g., using 'Get cookies.txt' browser extension).",
+                "link": "https://github.com/yt-dlp/yt-dlp#how-do-i-pass-cookies",
+            }, 400
+
+        # Create a secure temporary file for this request only
+        try:
+            with tempfile.NamedTemporaryFile(prefix="ydl_cookies_", suffix=".txt", delete=False) as tf:
+                # Restrict permissions on POSIX systems
+                try:
+                    os.chmod(tf.name, 0o600)
+                except Exception:
+                    pass
+                tf.write(decoded)
+                cookiefile_path = tf.name
+                delete_tmp_cookiefile = True
+                cookie_source = "body"
+                exists = os.path.isfile(cookiefile_path)
+                size = os.path.getsize(cookiefile_path) if exists else 0
+                _log("info", f"[POST /download] Body cookies temp file: {cookiefile_path} exists={exists} size={size}B first='{first_line[:120]}'")
+        except Exception as e:
+            return {"error": f"Failed to create temporary cookie file: {e}"}, 500
+    else:
+        # Fallback to server-side cookies file via environment variable
+        env_cookie_path = os.getenv("YTDLP_COOKIES_FILE")
+        if env_cookie_path:
+            exists, size, first_line, is_net, reason = _preview_cookies_file(env_cookie_path)
+            _log("info", f"[POST /download] Env YTDLP_COOKIES_FILE='{env_cookie_path}' exists={exists} size={size}B first='{first_line[:120]}' netscape={is_net} reason='{reason}'")
+            if exists:
+                if is_net:
+                    cookiefile_path = env_cookie_path
+                    cookie_source = "env"
+                else:
+                    # Log and ignore invalid env cookie file; continue without cookies.
+                    _log("warning", f"[POST /download] Env cookies file found but format invalid; ignoring. reason='{reason}'")
+            else:
+                _log("warning", "[POST /download] YTDLP_COOKIES_FILE set but file does not exist or is not readable; continuing without cookies.")
+
+    # Probe metadata first to enforce duration limit
+    ydl_probe_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+    }
+    if cookiefile_path:
+        ydl_probe_opts["cookiefile"] = cookiefile_path
+    _log("info", f"[POST /download] yt-dlp probe opts cookiefile={ydl_probe_opts.get('cookiefile')} source={cookie_source}")
+
+    try:
+        with YoutubeDL(ydl_probe_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        # Ensure cleanup of temp file on early failure
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+            except Exception:
+                pass
+        debug = {
+            "cookie_source": cookie_source,
+            "cookiefile": cookiefile_path,
+        }
+        return {"error": f"Failed to retrieve video info: {str(e)}", "debug": debug}, 400
+
+    duration = info.get("duration")  # seconds
+    if duration is None:
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+            except Exception:
+                pass
+        return {"error": "Unable to determine video duration."}, 400
+    if duration > 300:
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+            except Exception:
+                pass
+        return {"error": "Video is longer than 5 minutes and cannot be processed."}, 400
+
+    video_id = info.get("id")
+    if not video_id:
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+            except Exception:
+                pass
+        return {"error": "Could not determine video id."}, 400
+
+    outtmpl = os.path.join(AUDIOS_DIR, "%(id)s.%(ext)s")
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": outtmpl,
+        "quiet": True,
+        "noprogress": True,
+        "no_warnings": True,
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "256",
+            }
+        ],
+    }
+    if cookiefile_path:
+        ydl_opts["cookiefile"] = cookiefile_path
+    _log("info", f"[POST /download] yt-dlp download opts cookiefile={ydl_opts.get('cookiefile')} source={cookie_source}")
+
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+    except Exception as e:
+        msg = str(e)
+        if "ffmpeg" in msg.lower():
+            if delete_tmp_cookiefile and cookiefile_path:
+                try:
+                    if os.path.exists(cookiefile_path):
+                        os.remove(cookiefile_path)
+                except Exception:
+                    pass
+            return (
+                {
+                    "error": f"Download failed: {msg}",
+                    "action": "FFmpeg appears to be missing or inaccessible. Install FFmpeg and ensure it is on PATH.",
+                },
+                500,
+            )
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+            except Exception:
+                pass
+        debug = {
+            "cookie_source": cookie_source,
+            "cookiefile": cookiefile_path,
+        }
+        return {"error": f"Download failed: {msg}", "debug": debug}, 500
+    finally:
+        # Ensure temp cookie file is deleted after the operation completes
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+                    _log("info", f"[POST /download] Deleted body temp cookies file: {cookiefile_path}")
+            except Exception:
+                pass
+
+    mp3_path = os.path.join(AUDIOS_DIR, f"{video_id}.mp3")
+    if not os.path.exists(mp3_path):
+        candidates = [p for p in os.listdir(AUDIOS_DIR) if p.startswith(video_id) and p.endswith(".mp3")]
+        if candidates:
+            mp3_path = os.path.join(AUDIOS_DIR, candidates[0])
+        else:
+            return {"error": "MP3 file not found after download."}, 500
+
+    compress_audio(mp3_path, bitrate="256k")
+
+    expiration_ts = _now_ts() + RETENTION_SECONDS
+    thumbnail = info.get("thumbnail")
+    filename = os.path.basename(mp3_path)
+    direct_link = f"/audios/{filename}"
+
+    return {
+        "img": thumbnail,
+        "direct_link": direct_link,
+        "expiration_timestamp": expiration_ts,
+    }, 200
+
+
+# PUBLIC_INTERFACE
 @blp.route("/audios/<path:filename>")
 @limiter.limit("60 per minute")
 def audio_stream(filename: str):

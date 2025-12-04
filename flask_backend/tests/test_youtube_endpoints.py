@@ -250,3 +250,109 @@ def test_download_ignores_invalid_env_cookiefile_but_allows_public(monkeypatch, 
     assert resp.status_code == 200
     payload = resp.get_json()
     assert "direct_link" in payload
+
+
+# -------------------------
+# POST /download test cases
+# -------------------------
+
+def test_post_download_missing_url_returns_400(monkeypatch):
+    client = flask_app.test_client()
+    # Simulate ffmpeg exists
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    resp = client.post("/download", json={})
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert "url" in (data.get("error", "")).lower()
+
+
+def test_post_download_invalid_base64_returns_400(monkeypatch):
+    client = flask_app.test_client()
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    FakeYDL = _fake_youtubedl_factory(expected_id="p1", duration=60, create_mp3=False)
+    monkeypatch.setattr(yt_module, "YoutubeDL", FakeYDL)
+
+    resp = client.post("/download", json={"url": "https://www.youtube.com/watch?v=p1", "cookies_b64": "!@#$%^&*notbase64"})
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert "base64" in (data.get("error", "")).lower()
+
+
+def test_post_download_wrong_format_returns_400(monkeypatch):
+    client = flask_app.test_client()
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    FakeYDL = _fake_youtubedl_factory(expected_id="p2", duration=60, create_mp3=False)
+    monkeypatch.setattr(yt_module, "YoutubeDL", FakeYDL)
+
+    bad_content = b'{"cookie":"value"}'
+    cookies_b64 = base64.b64encode(bad_content).decode("ascii")
+    resp = client.post("/download", json={"url": "https://www.youtube.com/watch?v=p2", "cookies_b64": cookies_b64})
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert "netscape" in (data.get("error", "") + data.get("reason", "")).lower()
+
+
+def test_post_download_cookies_b64_precedence_over_env(monkeypatch, tmp_path):
+    client = flask_app.test_client()
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/ffmpeg")
+
+    # Create a valid env cookie file (netscape-like)
+    env_cookie = tmp_path / "env_cookies.txt"
+    env_cookie.write_text("# Netscape HTTP Cookie File\n.example.com\tTRUE\t/\tFALSE\t0\tsid\tenv\n", encoding="utf-8")
+    monkeypatch.setenv("YTDLP_COOKIES_FILE", str(env_cookie))
+
+    seen_opts = []
+
+    class FakeYDL:
+        def __init__(self, opts=None):
+            self.opts = opts or {}
+            seen_opts.append(self.opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {"id": "p3", "duration": 120, "thumbnail": "http://thumb/p3.jpg"}
+
+        def download(self, urls):
+            mp3_path = os.path.join(yt_module.AUDIOS_DIR, "p3.mp3")
+            os.makedirs(os.path.dirname(mp3_path), exist_ok=True)
+            with open(mp3_path, "wb") as f:
+                f.write(b"ID3")
+                f.write(b"\x00" * 512)
+
+    monkeypatch.setattr(yt_module, "YoutubeDL", FakeYDL)
+
+    # Provide body cookies_b64; should take precedence over env file
+    body_cookies = b"# Netscape HTTP Cookie File\n.example.com\tTRUE\t/\tFALSE\t0\tsid\tbody\n"
+    body_b64 = base64.b64encode(body_cookies).decode("ascii")
+
+    resp = client.post("/download", json={"url": "https://www.youtube.com/watch?v=p3", "cookies_b64": body_b64})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert "direct_link" in data
+
+    # Verify cookiefile used was not the env path (i.e., temp file used)
+    cookie_paths = [opts.get("cookiefile") for opts in seen_opts if "cookiefile" in opts]
+    assert cookie_paths, "Expected cookiefile to be passed to yt-dlp"
+    for p in cookie_paths:
+        assert os.path.isabs(p)
+        assert p != str(env_cookie)  # precedence over env path; temp file used
+    # Temp cookie file should be deleted after request
+    for p in set(cookie_paths):
+        assert not os.path.exists(p)
+
+
+def test_post_download_success(monkeypatch):
+    client = flask_app.test_client()
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    FakeYDL = _fake_youtubedl_factory(expected_id="p4", duration=100, thumbnail="http://thumb/p4.jpg", create_mp3=True)
+    monkeypatch.setattr(yt_module, "YoutubeDL", FakeYDL)
+
+    resp = client.post("/download", json={"url": "https://www.youtube.com/watch?v=p4"})
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert "direct_link" in payload
