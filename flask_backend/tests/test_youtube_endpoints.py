@@ -182,3 +182,71 @@ def test_download_uses_header_cookies_and_cleans_up_temp(monkeypatch):
     # (header cookies take precedence, and temp file is removed in finally)
     for p in set(cookie_paths):
         assert not os.path.exists(p)
+
+
+def test_download_invalid_header_base64_returns_400(monkeypatch):
+    client = flask_app.test_client()
+
+    # Simulate ffmpeg present
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/ffmpeg")
+
+    # Patch yt_dlp to avoid network
+    FakeYDL = _fake_youtubedl_factory(expected_id="invalid", duration=60, create_mp3=False)
+    monkeypatch.setattr(yt_module, "YoutubeDL", FakeYDL)
+
+    # Provide invalid base64
+    resp = client.get(
+        "/download",
+        query_string={"url": "https://www.youtube.com/watch?v=invalid"},
+        headers={"X-YTDLP-Cookies": "!!!notbase64!!!"},
+    )
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert "Invalid base64" in data.get("error", "")
+
+
+def test_download_invalid_header_wrong_format_returns_400(monkeypatch):
+    client = flask_app.test_client()
+
+    # Simulate ffmpeg present
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/ffmpeg")
+
+    # Patch yt_dlp to avoid network
+    FakeYDL = _fake_youtubedl_factory(expected_id="invfmt", duration=60, create_mp3=False)
+    monkeypatch.setattr(yt_module, "YoutubeDL", FakeYDL)
+
+    # Provide base64 of NON-Netscape content (e.g., JSON or random text)
+    bad_content = b'{"cookie":"value"}'
+    header_value = base64.b64encode(bad_content).decode("ascii")
+
+    resp = client.get(
+        "/download",
+        query_string={"url": "https://www.youtube.com/watch?v=invfmt"},
+        headers={"X-YTDLP-Cookies": header_value},
+    )
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert "not Netscape" in (data.get("error", "") + data.get("reason", ""))
+
+
+def test_download_ignores_invalid_env_cookiefile_but_allows_public(monkeypatch, tmp_path):
+    client = flask_app.test_client()
+
+    # Simulate ffmpeg present
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/ffmpeg")
+
+    # Create an invalid cookies file (wrong format)
+    bad_cookie_path = tmp_path / "cookies.txt"
+    bad_cookie_path.write_text("this is not a netscape cookies file\njust some text", encoding="utf-8")
+
+    # Set env var to point to the invalid cookie file
+    monkeypatch.setenv("YTDLP_COOKIES_FILE", str(bad_cookie_path))
+
+    # Patch yt_dlp to avoid network; public video scenario should still proceed
+    FakeYDL = _fake_youtubedl_factory(expected_id="pubok", duration=100, thumbnail="http://thumb/public.jpg", create_mp3=True)
+    monkeypatch.setattr(yt_module, "YoutubeDL", FakeYDL)
+
+    resp = client.get("/download", query_string={"url": "https://www.youtube.com/watch?v=pubok"})
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert "direct_link" in payload

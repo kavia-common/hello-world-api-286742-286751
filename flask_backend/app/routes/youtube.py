@@ -6,7 +6,7 @@ import tempfile
 import base64
 from typing import Generator, Optional, Tuple
 
-from flask import request, Response, send_from_directory
+from flask import request, Response, send_from_directory, current_app
 from flask.views import MethodView
 from flask_smorest import Blueprint
 from youtubesearchpython import VideosSearch
@@ -34,6 +34,80 @@ os.makedirs(AUDIOS_DIR, exist_ok=True)
 
 def _now_ts() -> int:
     return int(time.time())
+
+
+def _log(level: str, msg: str) -> None:
+    """
+    Lightweight logging wrapper that prefers Flask's logger when available,
+    falling back to print in non-app contexts (e.g., during tests).
+    """
+    try:
+        logger = current_app.logger  # type: ignore[attr-defined]
+        getattr(logger, level, logger.info)(msg)
+    except Exception:
+        print(f"[{level.upper()}] {msg}")
+
+
+def _preview_cookies_content(content: bytes) -> Tuple[bool, str, str]:
+    """
+    Inspect the given cookies.txt bytes and determine if it looks like Netscape format.
+    Returns (is_netscape, header_or_first_line, reason_when_false).
+    """
+    try:
+        # decode using utf-8 with fallback replacement to avoid exceptions
+        text = content.decode("utf-8", errors="replace")
+    except Exception:
+        return False, "", "Unable to decode cookies as UTF-8 text."
+
+    # Get the first non-empty line
+    first_line = ""
+    for line in text.splitlines():
+        if line.strip():
+            first_line = line.strip()
+            break
+
+    if not first_line:
+        return False, "", "Empty cookies file."
+
+    # Netscape cookie files typically start with this header comment
+    if first_line.startswith("# Netscape HTTP Cookie File"):
+        return True, first_line, ""
+
+    # Otherwise, look for a typical tab-separated cookie line with >= 7 fields
+    # Example: .example.com  TRUE    /   FALSE   0   sid    abcdef
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        # Netscape format must have at least 7 tab-separated columns
+        # Domain, flag, path, secure, expiration, name, value
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            return True, first_line, ""
+
+    # Heuristic: if the content appears to be base64 itself (common mistake),
+    # warn about wrong format
+    b64_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r")
+    if set(text.strip()) <= b64_chars and len(text.strip()) > 0:
+        return False, first_line, "Provided cookies look like base64 content, not Netscape cookies.txt text."
+
+    return False, first_line, "Cookies content does not appear to be in Netscape cookies.txt format."
+
+
+def _preview_cookies_file(path: str, max_bytes: int = 4096) -> Tuple[bool, int, str, bool, str]:
+    """
+    Return (exists, size, first_line, is_netscape, reason) for a cookies file path.
+    """
+    try:
+        exists = os.path.isfile(path) and os.access(path, os.R_OK)
+        if not exists:
+            return False, 0, "", False, "File not found or not readable."
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            content = f.read(max_bytes)
+        is_net, first, reason = _preview_cookies_content(content)
+        return True, size, first, is_net, reason
+    except Exception as e:
+        return False, 0, "", False, f"Error reading file: {e}"
 
 
 # PUBLIC_INTERFACE
@@ -286,14 +360,32 @@ def download():
 
     cookiefile_path: Optional[str] = None
     delete_tmp_cookiefile: bool = False
+    cookie_source = "none"
 
     # Read optional base64-encoded Netscape cookies from header (takes precedence)
     header_b64 = request.headers.get("X-YTDLP-Cookies")
     if header_b64:
+        _log("info", "[/download] Using cookies from header (X-YTDLP-Cookies). Decoding and validating format.")
         try:
             decoded = base64.b64decode(header_b64, validate=True)
         except Exception:
-            return {"error": "Invalid base64 in X-YTDLP-Cookies header."}, 400
+            return {
+                "error": "Invalid base64 in X-YTDLP-Cookies header.",
+                "guidance": "Pass base64-encoded Netscape cookies.txt text. Do not base64-encode base64 again.",
+                "link": "https://github.com/yt-dlp/yt-dlp#how-do-i-pass-cookies",
+            }, 400
+
+        # Validate Netscape format before writing
+        is_net, first_line, reason = _preview_cookies_content(decoded)
+        if not is_net:
+            return {
+                "error": "X-YTDLP-Cookies is not Netscape cookies.txt format.",
+                "reason": reason,
+                "preview_first_line": first_line,
+                "guidance": "Export cookies as Netscape-format cookies.txt (e.g., using 'Get cookies.txt' browser extension).",
+                "link": "https://github.com/yt-dlp/yt-dlp#how-do-i-pass-cookies",
+            }, 400
+
         # Create a secure temporary file for this request only
         try:
             with tempfile.NamedTemporaryFile(prefix="ydl_cookies_", suffix=".txt", delete=False) as tf:
@@ -301,18 +393,31 @@ def download():
                 try:
                     os.chmod(tf.name, 0o600)
                 except Exception:
-                    # On non-POSIX, chmod may not be supported; ignore
                     pass
                 tf.write(decoded)
                 cookiefile_path = tf.name
                 delete_tmp_cookiefile = True
+                cookie_source = "header"
+                exists = os.path.isfile(cookiefile_path)
+                size = os.path.getsize(cookiefile_path) if exists else 0
+                _log("info", f"[/download] Header cookies temp file: {cookiefile_path} exists={exists} size={size}B first='{first_line[:120]}'")
         except Exception as e:
             return {"error": f"Failed to create temporary cookie file: {e}"}, 500
     else:
         # Fallback to server-side cookies file via environment variable
         env_cookie_path = os.getenv("YTDLP_COOKIES_FILE")
-        if env_cookie_path and os.path.isfile(env_cookie_path):
-            cookiefile_path = env_cookie_path
+        if env_cookie_path:
+            exists, size, first_line, is_net, reason = _preview_cookies_file(env_cookie_path)
+            _log("info", f"[/download] Env YTDLP_COOKIES_FILE='{env_cookie_path}' exists={exists} size={size}B first='{first_line[:120]}' netscape={is_net} reason='{reason}'")
+            if exists:
+                if is_net:
+                    cookiefile_path = env_cookie_path
+                    cookie_source = "env"
+                else:
+                    # Log and ignore invalid env cookie file; continue without cookies.
+                    _log("warning", f"[/download] Env cookies file found but format invalid; ignoring. reason='{reason}'")
+            else:
+                _log("warning", "[/download] YTDLP_COOKIES_FILE set but file does not exist or is not readable; continuing without cookies.")
 
     # Probe metadata first to enforce duration limit
     ydl_probe_opts = {
@@ -322,6 +427,7 @@ def download():
     }
     if cookiefile_path:
         ydl_probe_opts["cookiefile"] = cookiefile_path
+    _log("info", f"[/download] yt-dlp probe opts cookiefile={ydl_probe_opts.get('cookiefile')} source={cookie_source}")
 
     try:
         with YoutubeDL(ydl_probe_opts) as ydl:
@@ -334,7 +440,11 @@ def download():
                     os.remove(cookiefile_path)
             except Exception:
                 pass
-        return {"error": f"Failed to retrieve video info: {str(e)}"}, 400
+        debug = {
+            "cookie_source": cookie_source,
+            "cookiefile": cookiefile_path,
+        }
+        return {"error": f"Failed to retrieve video info: {str(e)}", "debug": debug}, 400
 
     duration = info.get("duration")  # seconds
     if duration is None:
@@ -381,6 +491,7 @@ def download():
     }
     if cookiefile_path:
         ydl_opts["cookiefile"] = cookiefile_path
+    _log("info", f"[/download] yt-dlp download opts cookiefile={ydl_opts.get('cookiefile')} source={cookie_source}")
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
@@ -408,13 +519,18 @@ def download():
                     os.remove(cookiefile_path)
             except Exception:
                 pass
-        return {"error": f"Download failed: {msg}"}, 500
+        debug = {
+            "cookie_source": cookie_source,
+            "cookiefile": cookiefile_path,
+        }
+        return {"error": f"Download failed: {msg}", "debug": debug}, 500
     finally:
         # Ensure temp cookie file is deleted after the operation completes
         if delete_tmp_cookiefile and cookiefile_path:
             try:
                 if os.path.exists(cookiefile_path):
                     os.remove(cookiefile_path)
+                    _log("info", f"[/download] Deleted header temp cookies file: {cookiefile_path}")
             except Exception:
                 # Silently ignore cleanup errors
                 pass
