@@ -1,0 +1,28 @@
+# Project manifest for hello-world-api Flask backend
+name: hello-world-api
+version: 1.0.0
+description: Flask-based backend with YouTube-to-MP3 conversion capabilities
+
+containers:
+  - name: flask_backend
+    type: backend
+    framework: flask
+    
+    # Install command: update apt and install ffmpeg, then install Python dependencies
+    installCommand: sudo apt-get update && sudo apt-get install -y ffmpeg && pip install -r requirements.txt && pip install -r dev-requirements.txt
+    
+    # Start command: update apt and install ffmpeg (if not already installed), then start the Flask server
+    startCommand: sudo apt-get update && sudo apt-get install -y ffmpeg && bash start.sh
+    
+    workingDirectory: flask_backend
+    port: 3001
+    
+    healthCheck:
+      endpoint: /
+      interval: 30
+      timeout: 10
+      retries: 3
+    
+    environment:
+      - FLASK_ENV=development
+      - FLASK_APP=run.py
