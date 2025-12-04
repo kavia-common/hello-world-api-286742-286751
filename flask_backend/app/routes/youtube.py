@@ -33,6 +33,10 @@ BASE_DIR = os.path.dirname(os.path.dirname(__file__))  # flask_backend/app -> go
 AUDIOS_DIR = os.path.join(os.path.dirname(BASE_DIR), "audios")
 os.makedirs(AUDIOS_DIR, exist_ok=True)
 
+# Path to fallback cookies file
+COOKIE_DIR = os.path.join(os.path.dirname(BASE_DIR), "cookie")
+FALLBACK_COOKIES_FILE = os.path.join(COOKIE_DIR, "cookies.txt")
+
 # User-Agent to use for yt-dlp requests
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
@@ -259,7 +263,7 @@ def _download_audio_to_local_mp3(url: str, cookies_b64: Optional[str], header_b6
     """
     Reuse the same flow as /download to:
       - validate ffmpeg
-      - handle cookies (header or body precedence over env)
+      - handle cookies (header or body precedence over fallback file over env)
       - probe yt-dlp and enforce <= 5 minutes
       - download audio and return local mp3 path
 
@@ -284,7 +288,7 @@ def _download_audio_to_local_mp3(url: str, cookies_b64: Optional[str], header_b6
     delete_tmp_cookiefile: bool = False
     cookie_source = "none"
 
-    # Prefer header_b64 then cookies_b64, else env
+    # Prefer header_b64 then cookies_b64, else fallback file, else env
     b64_value = header_b64 or cookies_b64
     if b64_value:
         try:
@@ -321,13 +325,25 @@ def _download_audio_to_local_mp3(url: str, cookies_b64: Optional[str], header_b6
         except Exception as e:
             return None, {"error": f"Failed to create temporary cookie file: {e}"}, None, None, None
     else:
-        env_cookie_path = os.getenv("YTDLP_COOKIES_FILE")
-        if env_cookie_path:
-            exists, size, first_line, is_net, reason = _preview_cookies_file(env_cookie_path)
+        # Try fallback file first
+        if os.path.exists(FALLBACK_COOKIES_FILE):
+            exists, size, first_line, is_net, reason = _preview_cookies_file(FALLBACK_COOKIES_FILE)
             if exists and is_net:
-                cookiefile_path = env_cookie_path
-                cookie_source = "env"
-                _log("info", f"[download] Using env cookie file: {env_cookie_path} (size={size} bytes)")
+                cookiefile_path = FALLBACK_COOKIES_FILE
+                cookie_source = "file"
+                _log("info", f"[download] Using fallback cookie file: {FALLBACK_COOKIES_FILE} (size={size} bytes)")
+            elif exists:
+                _log("warning", f"[download] Fallback cookie file exists but invalid format: {reason}")
+        
+        # Fall back to env if fallback file not available
+        if not cookiefile_path:
+            env_cookie_path = os.getenv("YTDLP_COOKIES_FILE")
+            if env_cookie_path:
+                exists, size, first_line, is_net, reason = _preview_cookies_file(env_cookie_path)
+                if exists and is_net:
+                    cookiefile_path = env_cookie_path
+                    cookie_source = "env"
+                    _log("info", f"[download] Using env cookie file: {env_cookie_path} (size={size} bytes)")
 
     # Probe with enhanced options
     ydl_probe_opts = {
@@ -353,12 +369,13 @@ def _download_audio_to_local_mp3(url: str, cookies_b64: Optional[str], header_b6
             except Exception:
                 pass
         error_msg = str(e)
-        # Check if error is related to bot detection or cookies
-        if any(keyword in error_msg.lower() for keyword in ["bot", "captcha", "sign in", "verify", "cookie"]):
+        # Check if error is related to bot detection or authentication
+        if any(keyword in error_msg.lower() for keyword in ["bot", "captcha", "sign in", "verify", "cookie", "login"]):
             return None, {
-                "error": f"YouTube bot detection triggered or authentication required: {error_msg}",
-                "suggestion": "Ensure you're providing fresh, valid YouTube cookies. Cookies may have expired or YouTube may be detecting automated access.",
+                "error": f"YouTube authentication required or bot detection triggered: {error_msg}",
+                "suggestion": "This video may require authentication. Provide valid YouTube cookies via cookies_b64 parameter or place them in ./cookie/cookies.txt file.",
                 "cookie_source": cookie_source,
+                "status_code": 401 if "sign in" in error_msg.lower() or "login" in error_msg.lower() else 403,
             }, None, None, None
         return None, {"error": f"Failed to retrieve video info: {error_msg}", "cookie_source": cookie_source}, None, None, None
 
@@ -427,7 +444,7 @@ def _download_audio_to_local_mp3(url: str, cookies_b64: Optional[str], header_b6
             }, None, None, None
         
         # Check for bot detection or cookie issues
-        if any(keyword in msg.lower() for keyword in ["bot", "captcha", "sign in", "verify", "cookie"]):
+        if any(keyword in msg.lower() for keyword in ["bot", "captcha", "sign in", "verify", "cookie", "login"]):
             if delete_tmp_cookiefile and cookiefile_path:
                 try:
                     if os.path.exists(cookiefile_path):
@@ -435,9 +452,10 @@ def _download_audio_to_local_mp3(url: str, cookies_b64: Optional[str], header_b6
                 except Exception:
                     pass
             return None, {
-                "error": f"YouTube bot detection or authentication failure: {msg}",
-                "suggestion": "Your cookies may have expired or YouTube is detecting automated access. Try refreshing your cookies.",
+                "error": f"YouTube authentication required or bot detection triggered: {msg}",
+                "suggestion": "This video requires authentication. Provide valid YouTube cookies via cookies_b64 parameter or place them in ./cookie/cookies.txt file.",
                 "cookie_source": cookie_source,
+                "status_code": 401 if "sign in" in msg.lower() or "login" in msg.lower() else 403,
             }, None, None, None
             
         if delete_tmp_cookiefile and cookiefile_path:
@@ -473,7 +491,8 @@ def _download_audio_to_local_mp3(url: str, cookies_b64: Optional[str], header_b6
 @limiter.limit("3 per minute")
 @blp.doc(
     summary="Transcribe and summarize a YouTube video's audio using Groq.",
-    description="Accepts JSON with 'url' (required) and 'cookies_b64' (required base64 Netscape cookies.txt). "
+    description="Accepts JSON with 'url' (required) and 'cookies_b64' (optional base64 Netscape cookies.txt). "
+                "If cookies_b64 is not provided, falls back to reading cookies from ./cookie/cookies.txt. "
                 "Downloads audio using the same logic as /download (<= 5 minutes), transcribes via Groq Whisper, "
                 "and generates a concise summary and recommended title via Groq gpt-oss-20b. "
                 "Returns only summary, recommended_title, full_transcript.",
@@ -483,7 +502,7 @@ def _download_audio_to_local_mp3(url: str, cookies_b64: Optional[str], header_b6
             "application/json": {
                 "schema": {
                     "type": "object",
-                    "required": ["url", "cookies_b64"],
+                    "required": ["url"],
                     "properties": {
                         "url": {
                             "type": "string",
@@ -491,7 +510,7 @@ def _download_audio_to_local_mp3(url: str, cookies_b64: Optional[str], header_b6
                         },
                         "cookies_b64": {
                             "type": "string",
-                            "description": "Required: base64-encoded Netscape cookies.txt content (same as /download).",
+                            "description": "Optional: base64-encoded Netscape cookies.txt content. If not provided, falls back to ./cookie/cookies.txt.",
                         },
                     },
                 }
@@ -505,7 +524,7 @@ def summarize():
 
     Body:
       - url (str, required): YouTube URL (<= 5 minutes)
-      - cookies_b64 (str, required): base64 Netscape cookies.txt; required to mirror /download-secured flow.
+      - cookies_b64 (str, optional): base64 Netscape cookies.txt; if not provided, falls back to ./cookie/cookies.txt
 
     Returns:
       JSON with exactly:
@@ -514,7 +533,7 @@ def summarize():
         - full_transcript (str)
 
     Errors:
-      400 for missing/invalid inputs, 422 for parsing errors, 500 for server issues, 503 for missing dependencies.
+      400 for missing/invalid inputs, 401/403 for authentication issues, 422 for parsing errors, 500 for server issues, 503 for missing dependencies.
     """
     body = request.get_json(silent=True) or {}
     url = (body.get("url") or "").strip()
@@ -522,12 +541,6 @@ def summarize():
 
     if not url:
         return {"error": "Missing required JSON field 'url'."}, 400
-    if not cookies_b64:
-        # Require per design to mirror protected flow
-        return {
-            "error": "Missing required JSON field 'cookies_b64' (base64 Netscape cookies.txt).",
-            "guidance": "Export your YouTube cookies using a browser extension like 'Get cookies.txt', then base64-encode the file contents.",
-        }, 400
 
     # Check ffmpeg availability early and return 503 if missing
     if shutil.which("ffmpeg") is None:
@@ -551,9 +564,9 @@ def summarize():
             "service_status": "misconfigured"
         }, 503
 
-    # Reuse download logic to fetch local mp3 (with cookies delivered via body)
+    # Reuse download logic to fetch local mp3 (with cookies delivered via body or fallback file)
     try:
-        mp3_path, info, cookiefile_path, delete_tmp_cookiefile, _cookie_source = _download_audio_to_local_mp3(
+        mp3_path, info, cookiefile_path, delete_tmp_cookiefile, cookie_source = _download_audio_to_local_mp3(
             url=url,
             cookies_b64=cookies_b64,
             header_b64=None
@@ -570,9 +583,14 @@ def summarize():
                     pass
             # Determine appropriate status code based on error type
             error_msg = info.get("error", "").lower() if info else ""
+            status_code = info.get("status_code")
+            if status_code:
+                return info, status_code
             if "ffmpeg" in error_msg or "unavailable" in info.get("service_status", ""):
                 return info, 503
-            elif any(x in error_msg for x in ["invalid", "format", "base64", "cookies", "bot", "authentication"]):
+            elif "authentication" in error_msg or "bot detection" in error_msg:
+                return info, 401
+            elif any(x in error_msg for x in ["invalid", "format", "base64", "cookies"]):
                 return info, 400
             return info or {"error": "Unable to download audio."}, 400
     except Exception as e:
@@ -825,20 +843,31 @@ def download():
         except Exception as e:
             return {"error": f"Failed to create temporary cookie file: {e}"}, 500
     else:
+        # Try fallback file first
+        if os.path.exists(FALLBACK_COOKIES_FILE):
+            exists, size, first_line, is_net, reason = _preview_cookies_file(FALLBACK_COOKIES_FILE)
+            if exists and is_net:
+                cookiefile_path = FALLBACK_COOKIES_FILE
+                cookie_source = "file"
+                _log("info", f"[/download] Using fallback cookie file: {FALLBACK_COOKIES_FILE} (size={size} bytes)")
+            elif exists:
+                _log("warning", f"[/download] Fallback cookie file exists but invalid format: {reason}")
+        
         # Fallback to server-side cookies file via environment variable
-        env_cookie_path = os.getenv("YTDLP_COOKIES_FILE")
-        if env_cookie_path:
-            exists, size, first_line, is_net, reason = _preview_cookies_file(env_cookie_path)
-            _log("info", f"[/download] Env YTDLP_COOKIES_FILE='{env_cookie_path}' exists={exists} size={size}B first='{first_line[:120]}' netscape={is_net} reason='{reason}'")
-            if exists:
-                if is_net:
-                    cookiefile_path = env_cookie_path
-                    cookie_source = "env"
+        if not cookiefile_path:
+            env_cookie_path = os.getenv("YTDLP_COOKIES_FILE")
+            if env_cookie_path:
+                exists, size, first_line, is_net, reason = _preview_cookies_file(env_cookie_path)
+                _log("info", f"[/download] Env YTDLP_COOKIES_FILE='{env_cookie_path}' exists={exists} size={size}B first='{first_line[:120]}' netscape={is_net} reason='{reason}'")
+                if exists:
+                    if is_net:
+                        cookiefile_path = env_cookie_path
+                        cookie_source = "env"
+                    else:
+                        # Log and ignore invalid env cookie file; continue without cookies.
+                        _log("warning", f"[/download] Env cookies file found but format invalid; ignoring. reason='{reason}'")
                 else:
-                    # Log and ignore invalid env cookie file; continue without cookies.
-                    _log("warning", f"[/download] Env cookies file found but format invalid; ignoring. reason='{reason}'")
-            else:
-                _log("warning", "[/download] YTDLP_COOKIES_FILE set but file does not exist or is not readable; continuing without cookies.")
+                    _log("warning", "[/download] YTDLP_COOKIES_FILE set but file does not exist or is not readable; continuing without cookies.")
 
     # Probe metadata first to enforce duration limit
     ydl_probe_opts = {
@@ -867,12 +896,13 @@ def download():
             "cookiefile": cookiefile_path,
         }
         error_msg = str(e)
-        if any(keyword in error_msg.lower() for keyword in ["bot", "captcha", "sign in", "verify"]):
+        if any(keyword in error_msg.lower() for keyword in ["bot", "captcha", "sign in", "verify", "login"]):
+            status_code = 401 if "sign in" in error_msg.lower() or "login" in error_msg.lower() else 403
             return {
-                "error": f"YouTube bot detection or authentication required: {error_msg}",
-                "suggestion": "Provide fresh YouTube cookies via X-YTDLP-Cookies header or update YTDLP_COOKIES_FILE.",
+                "error": f"YouTube authentication required or bot detection triggered: {error_msg}",
+                "suggestion": "This video requires authentication. Provide valid YouTube cookies via X-YTDLP-Cookies header or place them in ./cookie/cookies.txt file.",
                 "debug": debug
-            }, 400
+            }, status_code
         return {"error": f"Failed to retrieve video info: {error_msg}", "debug": debug}, 400
 
     duration = info.get("duration")  # seconds
@@ -955,12 +985,13 @@ def download():
             "cookie_source": cookie_source,
             "cookiefile": cookiefile_path,
         }
-        if any(keyword in msg.lower() for keyword in ["bot", "captcha", "sign in", "verify"]):
+        if any(keyword in msg.lower() for keyword in ["bot", "captcha", "sign in", "verify", "login"]):
+            status_code = 401 if "sign in" in msg.lower() or "login" in msg.lower() else 403
             return {
-                "error": f"YouTube bot detection or authentication failure: {msg}",
-                "suggestion": "Cookies may have expired or YouTube is detecting automated access. Try refreshing your cookies.",
+                "error": f"YouTube authentication required or bot detection triggered: {msg}",
+                "suggestion": "This video requires authentication. Provide valid YouTube cookies via X-YTDLP-Cookies header or place them in ./cookie/cookies.txt file.",
                 "debug": debug
-            }, 400
+            }, status_code
         return {"error": f"Download failed: {msg}", "debug": debug}, 500
     finally:
         # Ensure temp cookie file is deleted after the operation completes
@@ -1003,9 +1034,10 @@ def download():
 @blp.doc(
     summary="Download YouTube audio as MP3 (<= 5 minutes) via JSON body.",
     description="Accepts a JSON body with 'url' (required) and optional 'cookies_b64'. "
+                "If 'cookies_b64' is not provided, falls back to reading cookies from ./cookie/cookies.txt. "
                 "If 'cookies_b64' is provided, it must be base64-encoded Netscape cookies.txt content "
                 "and will be written to a secure temporary file for this request, taking precedence over "
-                "the server-side YTDLP_COOKIES_FILE. The temporary file is deleted after the request.",
+                "the fallback file and server-side YTDLP_COOKIES_FILE. The temporary file is deleted after the request.",
     requestBody={
         "required": True,
         "content": {
@@ -1021,7 +1053,7 @@ def download():
                         },
                         "cookies_b64": {
                             "type": "string",
-                            "description": "Optional base64-encoded Netscape cookies.txt content for yt-dlp; takes precedence over YTDLP_COOKIES_FILE."
+                            "description": "Optional base64-encoded Netscape cookies.txt content for yt-dlp; takes precedence over fallback file and YTDLP_COOKIES_FILE."
                         }
                     }
                 }
@@ -1034,9 +1066,10 @@ def download_post():
 
     Body:
         - url (str, required): YouTube video URL to download as MP3 (<= 5 minutes)
-        - cookies_b64 (str, optional): base64-encoded Netscape cookies.txt content. If provided,
-          it will be written to a secure temporary file for the duration of the request and used
-          by yt-dlp, taking precedence over YTDLP_COOKIES_FILE.
+        - cookies_b64 (str, optional): base64-encoded Netscape cookies.txt content. If not provided,
+          falls back to ./cookie/cookies.txt. If provided, it will be written to a secure temporary 
+          file for the duration of the request and used by yt-dlp, taking precedence over fallback file
+          and YTDLP_COOKIES_FILE.
 
     Returns:
         tuple: (JSON dict, HTTP status code). On success, includes:
@@ -1051,6 +1084,7 @@ def download_post():
         - If ffmpeg is not installed: 500 with actionable guidance.
         - If video is too long (> 5 minutes): 400.
         - If extraction/download fails: 400/500 with message.
+        - If authentication required: 401/403 with clear message.
     """
     body = request.get_json(silent=True) or {}
     url = (body.get("url") or "").strip()
@@ -1119,20 +1153,31 @@ def download_post():
         except Exception as e:
             return {"error": f"Failed to create temporary cookie file: {e}"}, 500
     else:
+        # Try fallback file first
+        if os.path.exists(FALLBACK_COOKIES_FILE):
+            exists, size, first_line, is_net, reason = _preview_cookies_file(FALLBACK_COOKIES_FILE)
+            if exists and is_net:
+                cookiefile_path = FALLBACK_COOKIES_FILE
+                cookie_source = "file"
+                _log("info", f"[POST /download] Using fallback cookie file: {FALLBACK_COOKIES_FILE} (size={size} bytes)")
+            elif exists:
+                _log("warning", f"[POST /download] Fallback cookie file exists but invalid format: {reason}")
+        
         # Fallback to server-side cookies file via environment variable
-        env_cookie_path = os.getenv("YTDLP_COOKIES_FILE")
-        if env_cookie_path:
-            exists, size, first_line, is_net, reason = _preview_cookies_file(env_cookie_path)
-            _log("info", f"[POST /download] Env YTDLP_COOKIES_FILE='{env_cookie_path}' exists={exists} size={size}B first='{first_line[:120]}' netscape={is_net} reason='{reason}'")
-            if exists:
-                if is_net:
-                    cookiefile_path = env_cookie_path
-                    cookie_source = "env"
+        if not cookiefile_path:
+            env_cookie_path = os.getenv("YTDLP_COOKIES_FILE")
+            if env_cookie_path:
+                exists, size, first_line, is_net, reason = _preview_cookies_file(env_cookie_path)
+                _log("info", f"[POST /download] Env YTDLP_COOKIES_FILE='{env_cookie_path}' exists={exists} size={size}B first='{first_line[:120]}' netscape={is_net} reason='{reason}'")
+                if exists:
+                    if is_net:
+                        cookiefile_path = env_cookie_path
+                        cookie_source = "env"
+                    else:
+                        # Log and ignore invalid env cookie file; continue without cookies.
+                        _log("warning", f"[POST /download] Env cookies file found but format invalid; ignoring. reason='{reason}'")
                 else:
-                    # Log and ignore invalid env cookie file; continue without cookies.
-                    _log("warning", f"[POST /download] Env cookies file found but format invalid; ignoring. reason='{reason}'")
-            else:
-                _log("warning", "[POST /download] YTDLP_COOKIES_FILE set but file does not exist or is not readable; continuing without cookies.")
+                    _log("warning", "[POST /download] YTDLP_COOKIES_FILE set but file does not exist or is not readable; continuing without cookies.")
 
     # Probe metadata first to enforce duration limit
     ydl_probe_opts = {
@@ -1161,12 +1206,13 @@ def download_post():
             "cookiefile": cookiefile_path,
         }
         error_msg = str(e)
-        if any(keyword in error_msg.lower() for keyword in ["bot", "captcha", "sign in", "verify"]):
+        if any(keyword in error_msg.lower() for keyword in ["bot", "captcha", "sign in", "verify", "login"]):
+            status_code = 401 if "sign in" in error_msg.lower() or "login" in error_msg.lower() else 403
             return {
-                "error": f"YouTube bot detection or authentication required: {error_msg}",
-                "suggestion": "Provide fresh YouTube cookies via cookies_b64 field or update YTDLP_COOKIES_FILE.",
+                "error": f"YouTube authentication required or bot detection triggered: {error_msg}",
+                "suggestion": "This video requires authentication. Provide valid YouTube cookies via cookies_b64 field or place them in ./cookie/cookies.txt file.",
                 "debug": debug
-            }, 400
+            }, status_code
         return {"error": f"Failed to retrieve video info: {error_msg}", "debug": debug}, 400
 
     duration = info.get("duration")  # seconds
@@ -1248,12 +1294,13 @@ def download_post():
             "cookie_source": cookie_source,
             "cookiefile": cookiefile_path,
         }
-        if any(keyword in msg.lower() for keyword in ["bot", "captcha", "sign in", "verify"]):
+        if any(keyword in msg.lower() for keyword in ["bot", "captcha", "sign in", "verify", "login"]):
+            status_code = 401 if "sign in" in msg.lower() or "login" in msg.lower() else 403
             return {
-                "error": f"YouTube bot detection or authentication failure: {msg}",
-                "suggestion": "Cookies may have expired or YouTube is detecting automated access. Try refreshing your cookies.",
+                "error": f"YouTube authentication required or bot detection triggered: {msg}",
+                "suggestion": "This video requires authentication. Provide valid YouTube cookies via cookies_b64 field or place them in ./cookie/cookies.txt file.",
                 "debug": debug
-            }, 400
+            }, status_code
         return {"error": f"Download failed: {msg}", "debug": debug}, 500
     finally:
         # Ensure temp cookie file is deleted after the operation completes

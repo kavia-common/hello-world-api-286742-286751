@@ -124,6 +124,8 @@ The API uses appropriate HTTP status codes:
 
 **4xx Client Errors:**
 - `400` - Bad request (missing/invalid parameters)
+- `401` - Unauthorized (authentication required)
+- `403` - Forbidden (bot detection or access denied)
 - `404` - Resource not found
 
 **5xx Server Errors:**
@@ -148,31 +150,128 @@ If FFmpeg is not installed, endpoints that require it (`/download`, `/summarize`
 ```
 HTTP Status: `503 Service Unavailable`
 
+### Authentication Error Handling
+
+When YouTube requires authentication (age-restricted, private, or region-locked content), endpoints will return:
+```json
+{
+  "error": "YouTube authentication required or bot detection triggered: ...",
+  "suggestion": "This video requires authentication. Provide valid YouTube cookies via cookies_b64 parameter or place them in ./cookie/cookies.txt file.",
+  "debug": {
+    "cookie_source": "none",
+    "cookiefile": null
+  }
+}
+```
+HTTP Status: `401 Unauthorized` or `403 Forbidden`
+
 ## Cookie Support
 
-For age-restricted or region-locked YouTube content:
+For age-restricted, private, or region-locked YouTube content, the API supports multiple cookie sources with the following priority:
 
-**Server-side (environment):**
-```bash
-export YTDLP_COOKIES_FILE="/path/to/cookies.txt"
+### Priority Order (highest to lowest):
+1. **Per-request cookies_b64** (POST /download and POST /summarize)
+2. **Per-request X-YTDLP-Cookies header** (GET /download)
+3. **Fallback file: ./cookie/cookies.txt** (relative to flask_backend container root)
+4. **Environment variable: YTDLP_COOKIES_FILE**
+
+### Cookie File Format
+
+**All cookies must be in Netscape format.** This is a tab-separated text format used by cURL and many other tools.
+
+**Example Netscape cookies.txt format:**
+```
+# Netscape HTTP Cookie File
+# This is a generated file! Do not edit.
+.youtube.com	TRUE	/	TRUE	1234567890	CONSENT	YES+1
+.youtube.com	TRUE	/	FALSE	1234567890	VISITOR_INFO1_LIVE	abcdef123456
 ```
 
-**Per-request (header for GET /download):**
+**Format Requirements:**
+- First line should be: `# Netscape HTTP Cookie File`
+- Each cookie line has 7 tab-separated fields:
+  1. Domain
+  2. Flag (TRUE/FALSE)
+  3. Path
+  4. Secure flag (TRUE/FALSE)
+  5. Expiration timestamp
+  6. Cookie name
+  7. Cookie value
+
+### Obtaining Cookies in Netscape Format
+
+**Browser Extensions (Recommended):**
+- Chrome/Edge: "Get cookies.txt LOCALLY" extension
+- Firefox: "cookies.txt" extension
+- These extensions export cookies in the correct Netscape format
+
+**Steps:**
+1. Install a "Get cookies.txt" browser extension
+2. Log into YouTube in your browser
+3. Visit any YouTube video
+4. Click the extension icon to export cookies
+5. Save the exported file
+
+### Cookie Usage Examples
+
+**1. Fallback File (Simplest for persistent use):**
+```bash
+# Place your cookies.txt in the flask_backend/cookie/ directory
+mkdir -p flask_backend/cookie
+cp ~/Downloads/cookies.txt flask_backend/cookie/cookies.txt
+
+# The API will automatically use this file when cookies_b64 is not provided
+curl -X POST "http://localhost:3001/download" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://www.youtube.com/watch?v=abc123"}'
+```
+
+**2. Per-request via JSON body (POST /download and POST /summarize):**
+```bash
+# Base64 encode your cookies file
+COOKIES_B64=$(base64 -w 0 cookies.txt)
+
+# Download endpoint
+curl -X POST "http://localhost:3001/download" \
+  -H "Content-Type: application/json" \
+  -d "{\"url\":\"https://www.youtube.com/watch?v=abc123\",\"cookies_b64\":\"$COOKIES_B64\"}"
+
+# Summarize endpoint
+curl -X POST "http://localhost:3001/summarize" \
+  -H "Content-Type: application/json" \
+  -d "{\"url\":\"https://www.youtube.com/watch?v=abc123\",\"cookies_b64\":\"$COOKIES_B64\"}"
+```
+
+**3. Per-request via header (GET /download only):**
 ```bash
 curl -G "http://localhost:3001/download" \
   --data-urlencode "url=https://www.youtube.com/watch?v=abc123" \
   -H "X-YTDLP-Cookies: $(base64 -w 0 cookies.txt)"
 ```
 
-**Per-request (JSON body for POST):**
+**4. Server-side environment variable:**
 ```bash
-COOKIES_B64=$(base64 -w 0 cookies.txt)
-curl -X POST "http://localhost:3001/download" \
-  -H "Content-Type: application/json" \
-  -d "{\"url\":\"https://www.youtube.com/watch?v=abc123\",\"cookies_b64\":\"$COOKIES_B64\"}"
+export YTDLP_COOKIES_FILE="/path/to/cookies.txt"
+python run.py
 ```
 
-Cookies must be in Netscape format. Export using browser extensions like "Get cookies.txt".
+### Cookie Source Logging
+
+The application logs which cookie source is being used for each request:
+- `cookie_source=provided_b64` - Using cookies from request body/header
+- `cookie_source=file` - Using fallback file (./cookie/cookies.txt)
+- `cookie_source=env` - Using environment variable (YTDLP_COOKIES_FILE)
+- `cookie_source=none` - No cookies available
+
+### Important Cookie Notes
+
+1. **Fallback file location**: The `./cookie/cookies.txt` path is relative to the flask_backend container root (where run.py is located), not the working directory
+2. **Directory creation**: The `cookie/` directory will be created automatically if it doesn't exist
+3. **Cookie freshness**: YouTube cookies can expire. If you get authentication errors, refresh your cookies
+4. **Security**: Temporary cookie files created from base64 input are automatically deleted after each request
+5. **Format validation**: The API validates that cookies are in Netscape format and will reject invalid formats with helpful error messages
+6. **Base64 encoding**: Only encode the cookies.txt file once - do not double-encode
+7. **No cookies needed for public videos**: Most public YouTube videos work without cookies
 
 ## File Management
 
@@ -201,6 +300,13 @@ pytest tests/
 - Ensure `debug=False` and `use_reloader=False` in run.py
 - Check that FLASK_ENV is set to `production` in .env
 
+**HTTP 401/403 with authentication errors:**
+- The video requires authentication (age-restricted, private, or region-locked)
+- Provide valid YouTube cookies using one of the methods described above
+- Ensure cookies are in Netscape format (use a browser extension)
+- Check that cookies haven't expired - refresh if needed
+- Verify the fallback file exists: `ls -la flask_backend/cookie/cookies.txt`
+
 **HTTP 500 on /summarize:**
 - Verify GROQ_API_KEY is set in environment
 - Check FFmpeg is installed: `which ffmpeg`
@@ -212,12 +318,22 @@ pytest tests/
 
 **Invalid cookies errors:**
 - Ensure cookies are in Netscape format (not JSON or other formats)
-- Base64 encode the cookies file, not pre-encoded content
+- Use a browser extension like "Get cookies.txt LOCALLY" to export
+- Base64 encode the cookies file, not pre-encoded content (encode only once)
 - Verify cookies are fresh and not expired
+- Check the first line contains: `# Netscape HTTP Cookie File`
+
+**Fallback cookies not being used:**
+- Verify file exists: `ls -la flask_backend/cookie/cookies.txt`
+- Check file permissions are readable
+- Review logs for cookie source: should show `cookie_source=file`
+- Ensure file is in Netscape format (will be logged if invalid)
 
 ## Security Notes
 
-- Cookies are stored in secure temporary files (0600 permissions)
+- Cookies are stored in secure temporary files (0600 permissions) when provided via API
 - Temporary cookie files are deleted after each request
+- Fallback cookie file should have restricted permissions: `chmod 600 flask_backend/cookie/cookies.txt`
 - Rate limiting protects against abuse
 - CORS is configured to restrict origins (production should limit to known domains)
+- Never commit cookies.txt files to version control (add to .gitignore)
