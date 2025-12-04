@@ -12,6 +12,8 @@ from flask_smorest import Blueprint
 from youtubesearchpython import VideosSearch
 from yt_dlp import YoutubeDL
 from pydub import AudioSegment
+from groq import Groq
+import json
 
 # Import the global limiter instance from the app package
 from app import limiter  # type: ignore
@@ -248,6 +250,345 @@ def keep_alive() -> None:
     """Keep-alive task to prevent idling in some hosting environments."""
     while True:
         time.sleep(600)
+
+
+def _download_audio_to_local_mp3(url: str, cookies_b64: Optional[str], header_b64: Optional[str]) -> Tuple[Optional[str], Optional[dict], Optional[str], Optional[bool], Optional[str]]:
+    """
+    Reuse the same flow as /download to:
+      - validate ffmpeg
+      - handle cookies (header or body precedence over env)
+      - probe yt-dlp and enforce <= 5 minutes
+      - download audio and return local mp3 path
+
+    Returns:
+      (mp3_path, info, cookiefile_path, delete_tmp_cookiefile, cookie_source)
+      On failure, returns (None, {"error": ...}, cookiefile_path, delete_tmp_cookiefile, cookie_source)
+    """
+    if shutil.which("ffmpeg") is None:
+        return None, {
+            "error": "FFmpeg is required but was not found on the system PATH.",
+            "action": "Please install FFmpeg and ensure it is available on PATH.",
+        }, None, None, None
+
+    cookiefile_path: Optional[str] = None
+    delete_tmp_cookiefile: bool = False
+    cookie_source = "none"
+
+    # Prefer header_b64 then cookies_b64, else env
+    b64_value = header_b64 or cookies_b64
+    if b64_value:
+        try:
+            decoded = base64.b64decode(b64_value, validate=True)
+        except Exception:
+            return None, {
+                "error": "Invalid base64 in cookies value.",
+                "guidance": "Pass base64-encoded Netscape cookies.txt text. Do not base64-encode base64 again.",
+                "link": "https://github.com/yt-dlp/yt-dlp#how-do-i-pass-cookies",
+            }, None, None, None
+
+        is_net, first_line, reason = _preview_cookies_content(decoded)
+        if not is_net:
+            return None, {
+                "error": "Cookies value is not Netscape cookies.txt format.",
+                "reason": reason,
+                "preview_first_line": first_line,
+                "guidance": "Export cookies as Netscape-format cookies.txt (e.g., using 'Get cookies.txt' browser extension).",
+                "link": "https://github.com/yt-dlp/yt-dlp#how-do-i-pass-cookies",
+            }, None, None, None
+
+        try:
+            with tempfile.NamedTemporaryFile(prefix="ydl_cookies_", suffix=".txt", delete=False) as tf:
+                try:
+                    os.chmod(tf.name, 0o600)
+                except Exception:
+                    pass
+                tf.write(decoded)
+                cookiefile_path = tf.name
+                delete_tmp_cookiefile = True
+                cookie_source = "provided_b64"
+        except Exception as e:
+            return None, {"error": f"Failed to create temporary cookie file: {e}"}, None, None, None
+    else:
+        env_cookie_path = os.getenv("YTDLP_COOKIES_FILE")
+        if env_cookie_path:
+            exists, size, first_line, is_net, reason = _preview_cookies_file(env_cookie_path)
+            if exists and is_net:
+                cookiefile_path = env_cookie_path
+                cookie_source = "env"
+
+    # Probe
+    ydl_probe_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+    if cookiefile_path:
+        ydl_probe_opts["cookiefile"] = cookiefile_path
+    try:
+        with YoutubeDL(ydl_probe_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        # cleanup temp cookie if created
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+            except Exception:
+                pass
+        return None, {"error": f"Failed to retrieve video info: {str(e)}"}, None, None, None
+
+    duration = info.get("duration")
+    if duration is None:
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+            except Exception:
+                pass
+        return None, {"error": "Unable to determine video duration."}, None, None, None
+    if duration > 300:
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+            except Exception:
+                pass
+        return None, {"error": "Video is longer than 5 minutes and cannot be processed."}, None, None, None
+
+    video_id = info.get("id")
+    if not video_id:
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+            except Exception:
+                pass
+        return None, {"error": "Could not determine video id."}, None, None, None
+
+    outtmpl = os.path.join(AUDIOS_DIR, "%(id)s.%(ext)s")
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": outtmpl,
+        "quiet": True,
+        "noprogress": True,
+        "no_warnings": True,
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "256"}
+        ],
+    }
+    if cookiefile_path:
+        ydl_opts["cookiefile"] = cookiefile_path
+
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+    except Exception as e:
+        msg = str(e)
+        if "ffmpeg" in msg.lower():
+            if delete_tmp_cookiefile and cookiefile_path:
+                try:
+                    if os.path.exists(cookiefile_path):
+                        os.remove(cookiefile_path)
+                except Exception:
+                    pass
+            return None, {
+                "error": f"Download failed: {msg}",
+                "action": "FFmpeg appears to be missing or inaccessible. Install FFmpeg and ensure it is on PATH.",
+            }, None, None, None
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+            except Exception:
+                pass
+        return None, {"error": f"Download failed: {msg}"}, None, None, None
+
+    mp3_path = os.path.join(AUDIOS_DIR, f"{video_id}.mp3")
+    if not os.path.exists(mp3_path):
+        candidates = [p for p in os.listdir(AUDIOS_DIR) if p.startswith(video_id) and p.endswith(".mp3")]
+        if candidates:
+            mp3_path = os.path.join(AUDIOS_DIR, candidates[0])
+        else:
+            if delete_tmp_cookiefile and cookiefile_path:
+                try:
+                    if os.path.exists(cookiefile_path):
+                        os.remove(cookiefile_path)
+                except Exception:
+                    pass
+            return None, {"error": "MP3 file not found after download."}, None, None, None
+
+    # Compress to standard bitrate, ignore errors
+    compress_audio(mp3_path, bitrate="256k")
+    return mp3_path, info, cookiefile_path, delete_tmp_cookiefile, cookie_source
+
+
+# PUBLIC_INTERFACE
+@blp.route("/summarize", methods=["POST"])
+@limiter.limit("3 per minute")
+@blp.doc(
+    summary="Transcribe and summarize a YouTube video's audio using Groq.",
+    description="Accepts JSON with 'url' (required) and 'cookies_b64' (required base64 Netscape cookies.txt). "
+                "Downloads audio using the same logic as /download (<= 5 minutes), transcribes via Groq Whisper, "
+                "and generates a concise summary and recommended title via Groq gpt-oss-20b. "
+                "Returns only summary, recommended_title, full_transcript.",
+    requestBody={
+        "required": True,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "required": ["url", "cookies_b64"],
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "YouTube video URL (<= 5 minutes)",
+                        },
+                        "cookies_b64": {
+                            "type": "string",
+                            "description": "Required: base64-encoded Netscape cookies.txt content (same as /download).",
+                        },
+                    },
+                }
+            }
+        },
+    },
+)
+def summarize():
+    """
+    Transcribe and summarize YouTube audio.
+
+    Body:
+      - url (str, required): YouTube URL (<= 5 minutes)
+      - cookies_b64 (str, required): base64 Netscape cookies.txt; required to mirror /download-secured flow.
+
+    Returns:
+      JSON with exactly:
+        - summary (str)
+        - recommended_title (str)
+        - full_transcript (str)
+
+    Errors:
+      400/401 for missing/invalid inputs, 422 for parsing errors, 500 for server issues (incl. missing GROQ_API_KEY).
+    """
+    body = request.get_json(silent=True) or {}
+    url = (body.get("url") or "").strip()
+    cookies_b64 = body.get("cookies_b64")
+
+    if not url:
+        return {"error": "Missing required JSON field 'url'."}, 400
+    if not cookies_b64:
+        # Require per design to mirror protected flow
+        return {"error": "Missing required JSON field 'cookies_b64' (base64 Netscape cookies.txt)."}, 400
+
+    # Ensure GROQ_API_KEY present
+    if not os.getenv("GROQ_API_KEY"):
+        return {
+            "error": "Server misconfiguration: GROQ_API_KEY is not set.",
+            "action": "Set GROQ_API_KEY environment variable for Groq client authentication."
+        }, 500
+
+    # Reuse download logic to fetch local mp3 (with cookies delivered via body)
+    mp3_path, info, cookiefile_path, delete_tmp_cookiefile, _cookie_source = _download_audio_to_local_mp3(
+        url=url,
+        cookies_b64=cookies_b64,
+        header_b64=None
+    )
+
+    # If error dict returned in 'info'
+    if mp3_path is None:
+        # Attempt cleanup of any temp cookie
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+            except Exception:
+                pass
+        return info or {"error": "Unable to download audio."}, 400
+
+    # Transcribe with Groq Whisper
+    transcript_text = ""
+    try:
+        client = Groq()
+        with open(mp3_path, "rb") as f:
+            transcription = client.audio.transcriptions.create(
+                file=(mp3_path, f.read()),
+                model="whisper-large-v3",
+                temperature=0,
+                response_format="verbose_json",
+            )
+        # transcription may be an object; support dict-like as fallback
+        transcript_text = getattr(transcription, "text", None) or (transcription.get("text") if isinstance(transcription, dict) else "")
+        if not transcript_text:
+            return {"error": "Transcription failed: empty transcript."}, 500
+    except Exception as e:
+        # Clean temp cookie if created
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+            except Exception:
+                pass
+        return {"error": f"Transcription error: {str(e)}"}, 500
+
+    # Build prompt and summarize with gpt-oss-20b
+    def _chunk_text(txt: str, max_len: int = 8000):
+        if len(txt) <= max_len:
+            return [txt]
+        chunks = []
+        start = 0
+        while start < len(txt):
+            chunks.append(txt[start:start + max_len])
+            start += max_len
+        return chunks
+
+    try:
+        client = Groq()
+        # If transcript very large, include only first chunk to stay within token limits
+        chunks = _chunk_text(transcript_text, 8000)
+        prompt = (
+            "You are an assistant. Given the full transcript of a video, produce:\n"
+            "- summary: A concise, factual English summary (150-250 words) of the video's content.\n"
+            "- recommended_title: A punchy, SEO-friendly English title (<= 80 characters).\n"
+            "Return ONLY a minified JSON object with keys: summary, recommended_title.\n"
+            f"Transcript:\n{chunks[0]}"
+        )
+        completion = client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_completion_tokens=1500,
+            top_p=1,
+        )
+        content = completion.choices[0].message.content if completion and completion.choices else ""
+        data = {}
+        try:
+            data = json.loads(content)
+        except Exception:
+            # Attempt to salvage JSON by stripping surrounding text
+            try:
+                start = content.find("{")
+                end = content.rfind("}")
+                if start != -1 and end != -1:
+                    data = json.loads(content[start:end + 1])
+            except Exception:
+                return {"error": "Failed to parse summarization JSON from model."}, 422
+
+        summary = data.get("summary", "").strip()
+        recommended_title = data.get("recommended_title", "").strip()
+        if not summary or not recommended_title:
+            return {"error": "Model response missing required fields: summary or recommended_title."}, 422
+
+        return {
+            "summary": summary,
+            "recommended_title": recommended_title,
+            "full_transcript": transcript_text,
+        }, 200
+    except Exception as e:
+        return {"error": f"Summarization error: {str(e)}"}, 500
+    finally:
+        # cleanup temp cookie if created by helper
+        if delete_tmp_cookiefile and cookiefile_path:
+            try:
+                if os.path.exists(cookiefile_path):
+                    os.remove(cookiefile_path)
+            except Exception:
+                pass
 
 
 @blp.route("/search")

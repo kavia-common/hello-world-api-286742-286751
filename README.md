@@ -7,6 +7,7 @@ A simple Flask REST API exposing:
 - YouTube download (MP3): GET /download?url=<youtube_url> (returns direct_link + expiration)
 - YouTube download (MP3) via JSON: POST /download with {"url": "<youtube_url>", "cookies_b64": "<base64>"} (returns direct_link + expiration)
 - Audio streaming with Range support: GET /audios/<filename>
+- Summarize: POST /summarize with {"url": "<youtube_url>", "cookies_b64": "<base64 netscape cookies.txt>"} (returns summary, recommended_title, full_transcript)
 
 API documentation is available via Swagger UI at /docs.
 In Swagger UI, the /download endpoints include:
@@ -78,6 +79,27 @@ curl examples:
   ```
 
 Using Swagger UI:
+
+New: POST /summarize (Groq Whisper + gpt-oss-20b)
+- Requires environment variable GROQ_API_KEY to be set.
+- Body:
+  {
+    "url": "https://www.youtube.com/watch?v=<id>",
+    "cookies_b64": "<base64 netscape cookies.txt>"
+  }
+- Response:
+  {
+    "summary": "...",
+    "recommended_title": "...",
+    "full_transcript": "..."
+  }
+
+curl example:
+  COOKIES_B64=$(base64 -w 0 cookies.txt)
+  curl -X POST "https://<host>:3001/summarize" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $GROQ_API_KEY (set in server env only; not needed in client)" \
+    -d "{\"url\":\"https://www.youtube.com/watch?v=<id>\",\"cookies_b64\":\"$COOKIES_B64\"}"
 - Open https://<host>:3001/docs
 - Expand "YouTube MP3" -> POST /download
 - Click "Try it out", set the JSON body:

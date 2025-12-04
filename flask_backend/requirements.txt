@@ -28,3 +28,4 @@ pydub==0.25.1
 pytube==12.1.0
 youtube-search-python
 flask-limiter==2.8.1
+groq==0.12.0
