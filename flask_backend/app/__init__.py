@@ -1,10 +1,17 @@
 import os
 import threading
+from pathlib import Path
 from flask import Flask
 from flask_cors import CORS
 from flask_smorest import Api
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from dotenv import load_dotenv
+
+# Load environment variables from .env file before any other initialization
+# Look for .env in the flask_backend directory (parent of app/)
+dotenv_path = Path(__file__).resolve().parent.parent / '.env'
+load_dotenv(dotenv_path=dotenv_path)
 
 # Initialize Flask app
 app = Flask(__name__)
