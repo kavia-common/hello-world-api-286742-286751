@@ -8,6 +8,7 @@ A simple Flask REST API exposing:
 - Audio streaming with Range support: GET /audios/<filename>
 
 API documentation is available via Swagger UI at /docs.
+In Swagger UI, the /download endpoint exposes a required 'url' query parameter; provide a valid YouTube URL (e.g., https://www.youtube.com/watch?v=abc123) to test it.
 
 Getting started:
 - Dependencies are listed in flask_backend/requirements.txt

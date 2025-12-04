@@ -217,6 +217,14 @@ class Search(MethodView):
 # PUBLIC_INTERFACE
 @blp.route("/download")
 @limiter.limit("6 per minute")
+@blp.doc(parameters=[{
+    "name": "url",
+    "in": "query",
+    "required": True,
+    "schema": {"type": "string"},
+    "description": "YouTube video URL to download as MP3 (<= 5 minutes)",
+    "example": "https://www.youtube.com/watch?v=abc123"
+}])
 def download():
     """Download YouTube audio as MP3 (<= 5 minutes).
 
